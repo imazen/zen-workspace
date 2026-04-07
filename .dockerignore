@@ -1,0 +1,11 @@
+# Exclude build artifacts from Docker context
+**/target/
+**/.git/
+**/node_modules/
+# Keep only what we need
+!ultrahdr/
+!zenjpeg/
+# But exclude their targets too
+ultrahdr/target/
+zenjpeg/target/
+zenjpeg/internal/jpegli-cpp/

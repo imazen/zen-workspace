@@ -1,0 +1,58 @@
+# Superwork configuration — cross-repo orchestration metadata.
+# Per-crate CI config lives in each repo's [package.metadata.superwork].
+# This file holds only what can't live in individual repos.
+
+[superworkspace]
+name = "zen"
+default_github_org = "imazen"
+# Directories whose subdirectories are scanned as repos
+scan_dirs = ["../zen"]
+# Individual repo directories
+extra_roots = ["../archmage", "../moxcms", "../imageflow", "../codec-eval"]
+# Crates on crates.io whose repo URL doesn't match these orgs are external forks.
+owned_orgs = ["imazen", "lilith"]
+
+# ── Repo overrides (GitHub URL differs from convention) ──
+
+[[repo]]
+dir = "ravif"
+github = "imazen/cavif-rs"
+
+[[repo]]
+dir = "zenimage"
+github = "lilith/zenimage"
+
+[[repo]]
+dir = "../moxcms"
+github = "lilith/moxcms"
+
+[[repo]]
+dir = "../imageflow"
+github = "imazen/imageflow"
+
+[[repo]]
+dir = "../archmage"
+github = "imazen/archmage"
+
+[[repo]]
+dir = "../codec-eval"
+github = "imazen/codec-eval"
+
+# ── Checks ──
+
+[checks]
+test = "cargo test"
+clippy = "cargo clippy --all-targets -- -D warnings"
+fmt = "cargo fmt -- --check"
+msrv = "cargo hack check --rust-version"
+semver = "cargo semver-checks"
+
+# ── CI defaults ──
+
+[ci]
+default_strategy = "git_url"
+
+# ── Release pipeline ──
+
+[release]
+pre_publish = ["test", "clippy", "semver"]

@@ -64,7 +64,7 @@ semver = "cargo semver-checks"
 # ── CI defaults ──
 
 [ci]
-default_strategy = "git_url"
+default_strategy = "strip_path"
 
 # ── Release pipeline ──
 

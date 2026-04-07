@@ -8,7 +8,7 @@ default_github_org = "imazen"
 # Directories whose subdirectories are scanned as repos
 scan_dirs = ["../zen"]
 # Individual repo directories
-extra_roots = ["../archmage", "../moxcms", "../imageflow", "../codec-eval"]
+extra_roots = ["../archmage", "../moxcms", "../imageflow", "../codec-eval", "../imageflow-server-rs"]
 # Crates on crates.io whose repo URL doesn't match these orgs are external forks.
 owned_orgs = ["imazen", "lilith"]
 
@@ -37,6 +37,20 @@ github = "imazen/archmage"
 [[repo]]
 dir = "../codec-eval"
 github = "imazen/codec-eval"
+
+[[repo]]
+dir = "../imageflow-server-rs"
+github = "imazen/imageflow-server-rs"
+
+# ── CI overrides ──
+
+# Imageflow: delete [patch.crates-io] (contains local path overrides for zenpixels etc.)
+# and delete workspace deps that reference local zen paths
+[ci.overrides."imageflow_core"]
+delete_sections = ["patch.crates-io"]
+
+[ci.overrides."imageflow-server-core"]
+delete_sections = ["patch.crates-io"]
 
 # ── Checks ──
 

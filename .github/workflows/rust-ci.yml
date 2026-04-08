@@ -1,0 +1,109 @@
+name: Rust CI (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      test_args:
+        description: 'cargo test arguments (e.g., "--all-targets --features foo")'
+        type: string
+        default: '--all-targets'
+      test_extra_runs:
+        description: 'Additional test invocations, one per line (e.g., "cargo test --no-default-features")'
+        type: string
+        default: ''
+      clippy_args:
+        description: 'cargo clippy arguments'
+        type: string
+        default: '--all-targets -- -D warnings'
+      clippy_extra_runs:
+        description: 'Additional clippy invocations, one per line'
+        type: string
+        default: ''
+      platforms:
+        description: 'JSON array of OS runners (default: 7-platform matrix)'
+        type: string
+        default: |
+          ["ubuntu-latest", "ubuntu-24.04-arm", "macos-latest", "macos-26-intel", "windows-latest", "windows-11-arm"]
+      skip_msrv:
+        description: 'Skip MSRV check'
+        type: boolean
+        default: false
+      workspace_ref:
+        description: 'zen-workspace ref to use'
+        type: string
+        default: 'main'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.platforms) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: imazen/zen-workspace/.github/actions/setup@main
+        with:
+          components: clippy
+          workspace-ref: ${{ inputs.workspace_ref }}
+      - run: cargo clippy ${{ inputs.clippy_args }}
+      - name: Extra clippy runs
+        if: inputs.clippy_extra_runs != ''
+        shell: bash
+        run: |
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            echo "::group::$cmd"
+            $cmd
+            echo "::endgroup::"
+          done <<< "${{ inputs.clippy_extra_runs }}"
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.platforms) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: imazen/zen-workspace/.github/actions/setup@main
+        with:
+          workspace-ref: ${{ inputs.workspace_ref }}
+      - run: cargo test ${{ inputs.test_args }}
+      - name: Extra test runs
+        if: inputs.test_extra_runs != ''
+        shell: bash
+        run: |
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            echo "::group::$cmd"
+            $cmd
+            echo "::endgroup::"
+          done <<< "${{ inputs.test_extra_runs }}"
+
+  msrv:
+    name: MSRV
+    if: inputs.skip_msrv == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: imazen/zen-workspace/.github/actions/setup@main
+        with:
+          workspace-ref: ${{ inputs.workspace_ref }}
+      - uses: taiki-e/install-action@cargo-hack
+      - run: cargo hack check --rust-version

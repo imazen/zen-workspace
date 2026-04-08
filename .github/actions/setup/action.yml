@@ -1,0 +1,55 @@
+name: 'Superwork CI Setup'
+description: 'Checkout zen-workspace, install cargo-superwork, clone dep repos with path overrides'
+
+inputs:
+  components:
+    description: 'Rust toolchain components (comma-separated, e.g., "clippy,rustfmt")'
+    required: false
+    default: ''
+  toolchain:
+    description: 'Rust toolchain version (stable, nightly, 1.85, etc.)'
+    required: false
+    default: 'stable'
+  cache:
+    description: 'Enable Swatinem/rust-cache (true/false)'
+    required: false
+    default: 'true'
+  superwork-ref:
+    description: 'Git ref for cargo-superwork (branch, tag, or commit)'
+    required: false
+    default: 'main'
+  workspace-ref:
+    description: 'Git ref for zen-workspace'
+    required: false
+    default: 'main'
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout zen-workspace
+      uses: actions/checkout@v6
+      with:
+        repository: imazen/zen-workspace
+        path: zen-workspace
+        ref: ${{ inputs.workspace-ref }}
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+
+    - name: Cache cargo registry
+      if: inputs.cache == 'true'
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install cargo-superwork
+      shell: bash
+      run: |
+        if ! command -v cargo-superwork >/dev/null 2>&1; then
+          cargo install cargo-superwork --git https://github.com/imazen/cargo-superwork --branch ${{ inputs.superwork-ref }}
+        fi
+
+    - name: Clone dependency repos
+      shell: bash
+      run: cargo superwork ci-clone --add-paths --recursive --config zen-workspace/Superwork.toml

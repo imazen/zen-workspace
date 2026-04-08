@@ -42,9 +42,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: imazen/zen-workspace/.github/actions/setup@main
         with:
           components: rustfmt
+          workspace-ref: ${{ inputs.workspace_ref }}
       - run: cargo fmt --all --check
 
   clippy:

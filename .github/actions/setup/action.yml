@@ -39,10 +39,6 @@ runs:
         toolchain: ${{ inputs.toolchain }}
         components: ${{ inputs.components }}
 
-    - name: Cache cargo registry
-      if: inputs.cache == 'true'
-      uses: Swatinem/rust-cache@v2
-
     - name: Install cargo-superwork
       shell: bash
       run: |
@@ -53,3 +49,8 @@ runs:
     - name: Clone dependency repos
       shell: bash
       run: cargo superwork ci-clone --add-paths --recursive --config zen-workspace/Superwork.toml
+
+    # Cache AFTER ci-clone so cargo metadata can find all deps
+    - name: Cache cargo registry
+      if: inputs.cache == 'true'
+      uses: Swatinem/rust-cache@v2

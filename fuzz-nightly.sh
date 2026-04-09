@@ -138,6 +138,13 @@ if [ "$(git branch --show-current)" = "fuzz-setup" ]; then
     git stash pop -q 2>/dev/null || true
 fi
 
+# Sync new artifacts to block storage
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -x "$SCRIPT_DIR/fuzz-sync.sh" ]; then
+    echo "Syncing fuzz state to /mnt/v/fuzzes/ ..." | tee -a "$LOG"
+    "$SCRIPT_DIR/fuzz-sync.sh" push >> "$LOG" 2>&1 || echo "  sync failed (mount missing?)" | tee -a "$LOG"
+fi
+
 # Summary
 cat <<EOF | tee "$SUMMARY" | tee -a "$LOG"
 

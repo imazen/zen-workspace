@@ -46,7 +46,7 @@ Comparison of Imageflow against all major image CDNs and processing services.
 | JPEG 2000 | — | — | — | — | — | Yes | — | — | — | — | — | — | — | Yes |
 | OpenEXR | — | — | — | — | — | — | — | — | — | — | — | — | — | Yes |
 
-**Imageflow notes:** Decode via zencodecs (pure Rust). AVIF decode via zenavif, HEIC via heic-decoder-rs. JXL decode in progress (zenjxl-decoder exists). No SVG/PDF/PSD — these are document formats, not raster pipelines.
+**Imageflow notes:** Decode via zencodecs (pure Rust). AVIF decode via zenavif, HEIC via heic. JXL decode in progress (zenjxl-decoder exists). No SVG/PDF/PSD — these are document formats, not raster pipelines.
 
 ---
 
@@ -148,7 +148,7 @@ Comparison of Imageflow against all major image CDNs and processing services.
 | OCR | — | Yes | — | — | — | — | — | — | — | — | — | — | — | — |
 | NSFW detection | — | Yes | — | — | — | — | — | — | — | — | Yes | — | — | — |
 
-**Imageflow notes:** No AI/ML features in the image pipeline itself. `zenfaces` (ONNX face detection) and `zentract` (ONNX inference) exist as separate crates but aren't wired into imageflow4's URL API yet. This is the largest feature gap vs. SaaS competitors.
+**Imageflow notes:** No AI/ML features in the image pipeline itself. `zensally` (ONNX face detection) and `zentract` (ONNX inference) exist as separate crates but aren't wired into imageflow4's URL API yet. This is the largest feature gap vs. SaaS competitors.
 
 ---
 
@@ -328,7 +328,7 @@ Comparison of Imageflow against all major image CDNs and processing services.
 ### Where competitors lead:
 
 1. **AI/ML features** — Cloudinary and imgix have generative AI (fill, remove, replace, upscale, background removal). Imageflow has none in the URL API.
-2. **Face/content-aware cropping** — Every major SaaS CDN has this. Imageflow does not (zenfaces exists but isn't integrated).
+2. **Face/content-aware cropping** — Every major SaaS CDN has this. Imageflow does not (zensally exists but isn't integrated).
 3. **Text overlays** — Cloudinary, imgix, Sirv, ImageKit all render text. Imageflow doesn't do glyph rendering.
 4. **Auto format negotiation** — `f_auto` / `format=auto` is table stakes for CDNs. Imageflow has this planned but not shipped.
 5. **Video processing** — Cloudinary, imgix, ImageKit handle video. Imageflow is image-only.
@@ -361,7 +361,7 @@ Among **self-hosted** solutions (vs. Thumbor, Imaginary, libvips/sharp):
 **Close the gap on table-stakes features:**
 - `f_auto` format negotiation (highest impact, lowest effort)
 - AVIF + JXL encode (in progress via zenrav1e/zenjxl)
-- Face-aware crop (zenfaces exists, wire it in)
+- Face-aware crop (zensally exists, wire it in)
 - Blur filter (commonly expected)
 
 **Don't try to compete on:**

@@ -94,7 +94,7 @@ fuzz_crate() {
 }
 
 # All zen crates with fuzz targets
-fuzz_crate /home/lilith/work/zen/zencodecs
+fuzz_crate /home/lilith/work/zen/zenpipe/zencodecs
 fuzz_crate /home/lilith/work/zen/zenjpeg/zenjpeg
 fuzz_crate /home/lilith/work/zen/zenpng
 fuzz_crate /home/lilith/work/zen/zengif

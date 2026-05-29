@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# arm — ergonomic wrapper for the persistent Hetzner CAX21 ARM dev box.
+#
+# All traffic rides the ControlMaster socket (see ~/.ssh/config Host arm-zen),
+# so each invocation is ~0.3s instead of ~2s. Long jobs run in the persistent
+# `zen` tmux session so they survive disconnects and any agent can read them
+# back with `arm tail` / `arm capture`.
+#
+# Usage:
+#   arm                       # interactive shell on the box (cd ~/work/zen)
+#   arm <cmd...>              # run <cmd> in ~/work/zen, stream output, also tee
+#                             #   to /tmp/arm-last.log locally
+#   arm bg <name> <cmd...>    # launch <cmd> in tmux window <name> (survives
+#                             #   disconnect); returns immediately
+#   arm tail [name]           # tail -f the bg job's log for window <name>
+#   arm capture [name]        # dump the current tmux pane contents for <name>
+#   arm jobs                  # list tmux windows (running bg jobs)
+#   arm sync                  # rsync the local zen workspace UP to the box
+#                             #   (code only — excludes target/, .git, big data)
+#   arm pull <remote> <local> # rsync a file/dir back from the box
+#   arm status                # box health: arch, load, mem, disk, tmux jobs
+#   arm bench <crate>         # cargo bench <crate> in tmux window bench-<crate>,
+#                             #   results to ~/work/zen-arm-bench/<crate>.txt on box
+set -euo pipefail
+HOST=arm-zen
+WORKDIR='$HOME/work/zen'
+SESSION=zen
+
+# ensure master socket is up (cheap no-op if already running)
+ssh -o ConnectTimeout=10 "$HOST" true 2>/dev/null || true
+
+case "${1:-}" in
+  "")  exec ssh -t "$HOST" "cd $WORKDIR 2>/dev/null; exec bash -l" ;;
+
+  bg)
+    name="$2"; shift 2
+    # run in a fresh tmux window, log to a per-window file, keep window after exit
+    ssh "$HOST" "tmux new-window -t $SESSION -n '$name' \
+      \"cd $WORKDIR; { $*; } 2>&1 | tee /tmp/arm-$name.log; echo '[arm: $name exited '\\\$?']'; exec bash\""
+    echo "launched bg job '$name' (read: arm tail $name | arm capture $name)"
+    ;;
+
+  tail)
+    name="${2:-}"
+    [ -z "$name" ] && { echo "usage: arm tail <name>"; exit 1; }
+    exec ssh -t "$HOST" "tail -f /tmp/arm-$name.log"
+    ;;
+
+  capture)
+    name="${2:-}"
+    if [ -z "$name" ]; then
+      ssh "$HOST" "tmux capture-pane -t $SESSION -p"
+    else
+      ssh "$HOST" "tmux capture-pane -t $SESSION:$name -p"
+    fi
+    ;;
+
+  jobs)
+    ssh "$HOST" "tmux list-windows -t $SESSION 2>/dev/null || echo '(no zen session)'"
+    ;;
+
+  sync)
+    rsync -az --delete \
+      --exclude target/ --exclude .git/ --exclude '*.parquet' \
+      --exclude '*.bin' --exclude node_modules/ --exclude .jj/ \
+      -e ssh "$HOME/work/zen/" "$HOST:work/zen/"
+    echo "synced local ~/work/zen -> $HOST:~/work/zen (code only)"
+    ;;
+
+  pull)
+    rsync -az -e ssh "$HOST:$2" "$3"; echo "pulled $2 -> $3"
+    ;;
+
+  status)
+    ssh "$HOST" 'echo "arch:  $(uname -m)"; echo "load:  $(cut -d" " -f1-3 /proc/loadavg)"; \
+      free -m | awk "/Mem/{print \"mem:   \"\$3\"/\"\$2\" MB used\"}"; \
+      df -h / | awk "NR==2{print \"disk:  \"\$3\"/\"\$2\" (\"\$5\")\"}"; \
+      echo "tmux:"; tmux list-windows -t '"$SESSION"' 2>/dev/null | sed "s/^/  /" || echo "  (none)"'
+    ;;
+
+  bench)
+    crate="$2"
+    ssh "$HOST" "mkdir -p \$HOME/work/zen-arm-bench; tmux new-window -t $SESSION -n 'bench-$crate' \
+      \"cd $WORKDIR; cargo bench -p $crate 2>&1 | tee \$HOME/work/zen-arm-bench/$crate.txt; exec bash\""
+    echo "benching $crate in tmux window bench-$crate (read: arm capture bench-$crate)"
+    ;;
+
+  *)
+    # generic: run in workdir, stream + tee locally
+    ssh "$HOST" "cd $WORKDIR 2>/dev/null; $*" 2>&1 | tee /tmp/arm-last.log
+    ;;
+esac

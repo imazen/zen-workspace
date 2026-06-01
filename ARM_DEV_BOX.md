@@ -1,11 +1,27 @@
-# ARM dev box (zen-arm-dev) — Hetzner CAX21
+# ARM dev boxes — Hetzner CAX21 (`arm-zen`) + CAX31 (`arm-big`)
 
-Primary persistent ARM box for autonomous perf iteration across zen crates.
-Provisioned 2026-05-28 to bypass the Oracle A1.Flex free-tier capacity-wait
+Persistent ARM boxes for autonomous perf iteration across zen crates.
+Provisioned to bypass the Oracle A1.Flex free-tier capacity-wait
 lottery (a separate retry loop still races for the eventual free-tier slot;
-see `ORACLE_ARM_BOX.md`). Hetzner CAX21 ships Ampere Altra Neoverse N1 — the
+see `ORACLE_ARM_BOX.md`). Both ship Ampere Altra Neoverse N1 — the
 **same ISA family** as Oracle A1.Flex (Neoverse N1) — so any tuning derived
 here transfers directly.
+
+## Two-box model
+
+| Alias | Shape | Cores | RAM | Disk | IP | Role |
+|---|---|--:|--:|--:|---|---|
+| `arm-zen` | CAX21 | 4 | 8 GB | 80 GB | 167.233.19.242 | shared / full-stack (phone-access tmux, claude on box) |
+| `arm-big` | CAX31 | 8 | 16 GB | 160 GB | 167.233.18.12 | the roomy build / bench box |
+
+Both run identical parity tooling (same cloud-init + `.mise.toml` fleet +
+`~/.ssh/zen-arm-dev` key + disk-guard cron). Use `arm-big` for heavy
+parallel builds and benches that want 8 cores + the 160 GB disk;
+`arm-zen` is the smaller always-on box wired for phone access.
+
+The `arm` wrapper at `~/work/zen/scripts/arm` honors `ARM_HOST` —
+`ARM_HOST=arm-big ~/work/zen/scripts/arm '<cmd>'` targets the big box;
+unset defaults to `arm-zen`.
 
 ## Connection
 
@@ -22,6 +38,51 @@ here transfers directly.
 - Cost: €0.0118/hr, **€8.46/mo monthly cap** (Hetzner billing caps cloud
   servers at one month equivalent; the box is effectively flat-rate above
   ~30 days/mo of uptime)
+
+## arm-big — CAX31 (the roomy build/bench box)
+
+Second persistent ARM box, provisioned 2026-06-01 via a retry loop that
+finally caught Hetzner CAX capacity (there had been a full CAX outage).
+Booted from the **same** cloud-init + `~/.ssh/zen-arm-dev` key as `arm-zen`,
+then finalized to full parity (mise fleet + awscli + disk-guard cron).
+
+- Alias: `ssh arm-big`
+- Public IPv4: `167.233.18.12`
+- User: `ubuntu` (cloud-init created it + installed the key directly — no
+  root-fixup needed, unlike arm-zen's first boot)
+- Key: `~/.ssh/zen-arm-dev` (shared with arm-zen; ed25519, mode 600)
+- Shape: CAX31 — **8 vCPU** (Ampere Altra, Neoverse N1) + **16 GB RAM** +
+  **160 GB** NVMe (verified on-box: `nproc`=8, `free -g` total=15 GB)
+- Location: `fsn1` (Falkenstein DC Park 1, Germany)
+- Hetzner name: `zen-arm-big`
+- Cost: **€0.0235/hr ≈ €16.90/mo monthly cap**
+- Usage: `ARM_HOST=arm-big ~/work/zen/scripts/arm '<cmd>'`
+- Destroy (only if replacing): `hcloud server delete zen-arm-big`
+- chage PAM fix: confirmed applied by cloud-init (ubuntu password "expires
+  never"; no SSH-time password-change demand).
+
+### Finalization notes (2026-06-01)
+
+- **cloud-init reported `status: error`** solely because the apt package
+  `awscli` is unavailable on arm64 Ubuntu 24.04 (Candidate: none), which
+  failed the whole `package_update_upgrade_install` module. All 21 other
+  base dev packages installed fine. Fallback applied (mirrors arm-zen):
+  installed aws-cli v2 via the official bundle
+  (`curl https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip` →
+  `sudo ./aws/install`) → `/usr/local/bin/aws` 2.34.57. **The cloud-init
+  YAML should drop `awscli` from its apt package list to avoid the false
+  error on future boxes** — install awscli via the bundle in the extras
+  layer instead.
+- mise fleet installed cleanly with `GITHUB_TOKEN` pre-staged at
+  `~/.config/mise/env.toml` (mode 600) — same rate-limit avoidance as
+  arm-zen. Versions: jj 0.41.0, just 1.51.0, samply 0.13.1, ripgrep 15.1.0,
+  fd 10.4.2, bat, fzf, hyperfine 1.20.0, gh 2.93.0, oxipng, mdbook 0.5.3,
+  node v24.16.0, python 3.12.13, rustc/cargo 1.96.0, full cargo-* fleet
+  incl. cargo-sweep 0.8.0 (disk-guard dep).
+- disk-guard cron installed (`*/30 * * * * $HOME/bin/disk-guard.sh`, pulled
+  from arm-zen) — `cargo sweep --recursive --time 1 ~/work/zen` when `/` > 85%.
+- ControlMaster latency: cold 2.67s → reused 0.31s (socket at
+  `~/.ssh/cm/ubuntu@167.233.18.12:22`), matching arm-zen's multiplexing.
 
 ## Phone access (Z Fold 7 / Termux) — added 2026-05-29
 

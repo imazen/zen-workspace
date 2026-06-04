@@ -20,10 +20,14 @@ on:
         type: string
         default: ''
       platforms:
-        description: 'JSON array of OS runners (default: 7-platform matrix)'
+        # macOS dropped from the default 2026-06-03 to cut Actions spend — macOS
+        # 3-core bills at ~10x Linux and was the dominant cost. Repos that truly
+        # need macOS coverage can opt back in by passing `platforms` explicitly
+        # with "macos-latest" / "macos-26-intel".
+        description: 'JSON array of OS runners (default: Linux + Windows, no macOS)'
         type: string
         default: |
-          ["ubuntu-latest", "ubuntu-24.04-arm", "macos-latest", "macos-26-intel", "windows-latest", "windows-11-arm"]
+          ["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "windows-11-arm"]
       skip_msrv:
         description: 'Skip MSRV check'
         type: boolean

@@ -50,7 +50,10 @@ jobs:
         with:
           components: rustfmt
           workspace-ref: ${{ inputs.workspace_ref }}
-      - run: cargo fmt --all --check
+      # Scope to in-repo workspace members: `cargo fmt --all` also reaches
+      # into path-dependency crates, and after ci-clone those are sibling
+      # clones of OTHER repos (their formatting is not this repo's gate).
+      - run: cargo fmt $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name' | sed 's/^/-p /') -- --check
 
   clippy:
     name: Clippy (${{ matrix.os }})

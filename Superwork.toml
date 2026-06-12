@@ -128,6 +128,13 @@ whereat = "https://github.com/lilith/whereat"
 zenavif = "https://github.com/imazen/zenavif"
 zenavif-parse = "https://github.com/imazen/zenavif-parse"
 zenavif-serialize = "https://github.com/imazen/zenavif-serialize"
+# zenanalyze repo: zenjpeg pins `zenanalyze = { git = …, rev = … }` at its
+# workspace root and path-deps `../../zenanalyze/zenpredict`. Without these
+# mappings ci-clone hits "no git URL for 'zenanalyze', skipping" — the repo
+# is never cloned as a sibling, the git pin is never rewritten to a path, and
+# its registry zenpixels splits from the sibling-pathed copy (E0308 type
+# mismatches compiling zenjpeg in consumer CI; broke zenpipe CI 2026-06-12).
+zenanalyze = "https://github.com/imazen/zenanalyze"
 zenbench = "https://github.com/imazen/zenbench"
 zenbitmaps = "https://github.com/imazen/zenbitmaps"
 zenblend = "https://github.com/imazen/zenblend"
@@ -147,8 +154,11 @@ zennode-derive = "https://github.com/imazen/zennode"
 zennode = "https://github.com/imazen/zennode"
 zenpipe = "https://github.com/imazen/zenpipe"
 zenpixels-convert = "https://github.com/imazen/zenpixels"
+zenpicker = "https://github.com/imazen/zenanalyze"
 zenpixels = "https://github.com/imazen/zenpixels"
 zenpng = "https://github.com/imazen/zenpng"
+zenpredict = "https://github.com/imazen/zenanalyze"
+zenpredict-bake = "https://github.com/imazen/zenanalyze"
 zenquant = "https://github.com/imazen/zenquant"
 zenrav1e = "https://github.com/imazen/zenrav1e"
 zenravif = "https://github.com/imazen/cavif-rs"

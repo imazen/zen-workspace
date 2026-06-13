@@ -1,0 +1,26 @@
+[Unit]
+Description=zen continuous fuzz rotation (libFuzzer, all zen crates)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME=/root
+Environment=PATH=/root/.cargo/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=ZEN_ROOT=/root/work/zen
+Environment=FUZZ_HOME=/root/fuzz-farm
+Environment=R2_ENV=/root/.config/zenfuzz/r2.env
+Environment=SLICE_SECS=600
+Environment=CARGO_TERM_COLOR=never
+Environment=RUST_BACKTRACE=1
+ExecStart=/root/fuzz-farm/bin/fuzz-rotate.sh
+Restart=always
+RestartSec=15
+# Backstop so a libFuzzer fork storm can't take the box down (the runner also
+# sizes per-fork RSS from RAM). Leave headroom for the OS on a 16 GB box.
+MemoryMax=14G
+OOMPolicy=continue
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

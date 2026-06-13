@@ -1,0 +1,35 @@
+# Canonical zen fuzz crates, relative to ZEN_ROOT (~/work/zen). One per line;
+# blank lines and # comments ignored. fuzz-rotate.sh fuzzes exactly these (any
+# that have fuzz/fuzz_targets + libfuzzer-sys). This deliberately excludes stale
+# agent worktrees (.claude/worktrees/*), scratch copies (_dbg, *-perm-corpus,
+# *--* worktrees), vendored upstream (naga), the stale nested zenjxl-decoder
+# sub-crate, and the AFL-only rawloader-fork (different harness). Add a line to
+# onboard a new crate.
+aom-decoder-rs
+fax
+heic
+image-tiff
+rav1d-safe
+ultrahdr
+weezl
+zenanalyze/zenpredict
+zenavif
+zenavif-parse
+zenbitmaps
+zencodec
+zenextras/zenpdf
+zenextras/zensvg
+zenextras/zentiff
+zenflate
+zengif
+zenjpeg/zenjpeg
+zenjpeg/internal/jpegli-cpp/jpegli-rs/jpegli
+zenjxl-decoder
+zenpipe
+zenpipe/zencodecs
+zenpng
+zenrav1e
+zenraw
+zentone
+zenwebp
+zenzstd

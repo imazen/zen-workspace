@@ -127,6 +127,14 @@ PY
     if [ -n "$url" ]; then
       echo "  filed $repo: $url"
       echo -e "$sig_hash\t$repo\t$url" >>"$LEDGER"; filed=$((filed+1))
+    elif [ "$(gh repo view "$repo" --json hasIssuesEnabled -q .hasIssuesEnabled 2>/dev/null)" = "false" ]; then
+      # Issues are disabled on this repo — creating will fail forever. Queue it
+      # for manual review and ledger it so we don't retry-loop every run (e.g.
+      # lilith/weezl, 2026-06-14). The repro + meta still live in R2.
+      echo "  ⚠ $repo has Issues disabled — queued for manual review (sig $sig_hash)"
+      echo -e "$sig_hash\t$repo\t$target\t$arch\t$cdir\tISSUES-DISABLED" >>"$QUEUE"
+      echo -e "$sig_hash\t$repo\t(issues-disabled — queued for manual review)" >>"$LEDGER"
+      queued=$((queued+1))
     else
       echo "  FAILED to file issue for $repo (sig $sig_hash) — left for retry" >&2
     fi

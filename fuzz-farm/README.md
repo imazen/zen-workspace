@@ -80,8 +80,20 @@ DRY_RUN=1 ./triage-crashes.sh
 
 Scripts are version-controlled here (`zen-workspace/fuzz-farm`); the running copy
 lives at `~/work/zenfuzz-farm/`, where the crons execute from (decoupled from the
-repo checkout state). Redeploy after edits:
-`cp ~/work/zen-workspace/fuzz-farm/* ~/work/zenfuzz-farm/`.
+repo checkout state). After committing+pushing an edit, redeploy everywhere with
+one versioned command:
+
+```bash
+~/work/zenfuzz-farm/deploy.sh            # deploy origin/main to ops dir + every box, restart fuzzers
+~/work/zenfuzz-farm/deploy.sh <git-ref>  # pin a specific commit/branch/tag
+```
+
+`deploy.sh` extracts the ref with `git archive` (no checkout — ignores any WIP in
+the primary checkout), refreshes the ops dir, pushes the box-runtime files to
+every `purpose=fuzz` box, restarts each `zen-fuzz`, and writes the deployed commit
+to `DEPLOYED_VERSION` (ops dir + each box) so the live version is always visible.
+First-time bootstrap (before deploy.sh is in the ops dir):
+`git -C ~/work/zen-workspace archive origin/main fuzz-farm | tar -x --strip-components=1 -C ~/work/zenfuzz-farm`.
 
 ### Recommended workstation crons
 
@@ -137,5 +149,6 @@ sibling.
 | `sync-tree.sh` | workstation | rsync buildable tree to boxes |
 | `refresh-r2-creds.sh` | workstation | mint + push scoped R2 creds |
 | `triage-crashes.sh` | workstation | pull crashes, dedup, file issues |
+| `deploy.sh` | workstation | versioned redeploy to ops dir + all boxes |
 | `launch-boxes.sh` | workstation | create + provision boxes (billable) |
 | `kill-boxes.sh` | workstation | delete boxes |

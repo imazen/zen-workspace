@@ -114,10 +114,18 @@ First-time bootstrap (before deploy.sh is in the ops dir):
 37  4 */4 * *  cd ~/work/zenfuzz-farm && ./refresh-r2-creds.sh >> /tmp/fuzz-cred.log   2>&1
 ```
 
-`bringup-arm.sh` (auto-provision a *dedicated* cax31 when CAX stock returns) is
-**not** armed by default — ARM coverage runs on `zen-arm-dev`. Arm it only if you
-want an extra dedicated ARM box:
-`*/20 * * * * cd ~/work/zenfuzz-farm && ./bringup-arm.sh >> /tmp/fuzz-arm.log 2>&1`
+**ARM grab (armed):** `grab-arm-dev.sh` runs every 30 min and, the moment a
+≥32 GB ARM box (cax41) is in stock, creates `zen-arm-xl` and provisions it as a
+**dev box** (full mise toolchain via `setup-arm-box.sh`) that *also* fuzzes as a
+niced background layer (dev stays primary), then self-disarms. It's labeled
+`purpose=dev` (so `kill-boxes.sh` never touches it). Finish with a one-time
+`claude` OAuth login on the box.
+```cron
+*/30 * * * * cd ~/work/zenfuzz-farm && ./grab-arm-dev.sh >> /tmp/fuzz-arm-grab.log 2>&1
+```
+`bringup-arm.sh` is the alternative: a *dedicated fuzz-only* ARM box (`zen-fuzz-arm`,
+`purpose=fuzz`, disposable) — arm it instead of grab-arm-dev only if you want a
+throwaway fuzzer rather than a dev box.
 
 ## Credentials
 
@@ -162,5 +170,7 @@ sibling.
 | `refresh-r2-creds.sh` | workstation | mint + push scoped R2 creds |
 | `triage-crashes.sh` | workstation | pull crashes, dedup, file issues |
 | `deploy.sh` | workstation | versioned redeploy to ops dir + all boxes |
-| `launch-boxes.sh` | workstation | create + provision boxes (billable) |
-| `kill-boxes.sh` | workstation | delete boxes |
+| `launch-boxes.sh` | workstation | create + provision dedicated fuzz boxes (billable) |
+| `grab-arm-dev.sh` | workstation | (cron) grab a ≥32GB ARM box when in stock → dev box + niced fuzz |
+| `bringup-arm.sh` | workstation | (alt) grab a dedicated fuzz-only ARM box |
+| `kill-boxes.sh` | workstation | delete dedicated (purpose=fuzz) boxes |

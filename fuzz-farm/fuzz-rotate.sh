@@ -177,13 +177,30 @@ fuzz_one() { # <crate_dir> <target>
     [ -f "$d" ] && { dict_arg="-dict=$d"; break; }
   done
 
+  # Pass any required-features the [[bin]] declares (e.g. the differential dav1d
+  # targets gated behind `differential` / `zenrav1e/decode_test_dav1d`), else
+  # `cargo fuzz build/run <target>` errors "target requires the features: ...".
+  local feat_arg="" rf
+  rf="$( ( cd "$crate_dir" && cargo metadata --no-deps --format-version 1 \
+            --manifest-path fuzz/Cargo.toml 2>/dev/null ) | python3 -c '
+import json,sys
+n=sys.argv[1]
+try: m=json.load(sys.stdin)
+except Exception: sys.exit(0)
+for p in m.get("packages",[]):
+    for t in p.get("targets",[]):
+        if t.get("name")==n and "bin" in t.get("kind",[]):
+            print(",".join(t.get("required-features") or t.get("required_features") or [])); sys.exit(0)
+' "$target" 2>/dev/null )"
+  [ -n "$rf" ] && feat_arg="--features=$rf"
+
   r2_pull_corpus "$key" "$corpus"
 
   local tlog="$FUZZ_HOME/logs/$(echo "$key" | tr '/' '_').log"
   # Build FIRST, outside the fuzz slice — a cold build of a heavy crate can take
   # many minutes; only a generous hang-guard caps it. Skip a target that won't
   # build (logged, retried next pass when source may have been re-synced).
-  if ! ( cd "$crate_dir" && timeout 1800 cargo +nightly fuzz build "$target" ) >>"$tlog" 2>&1; then
+  if ! ( cd "$crate_dir" && timeout 1800 cargo +nightly fuzz build $feat_arg "$target" ) >>"$tlog" 2>&1; then
     log "  build failed/skipped: $rel :: $target (tail $(basename "$tlog"))"
     return 0
   fi
@@ -193,7 +210,7 @@ fuzz_one() { # <crate_dir> <target>
   # Only the FUZZING is time-boxed (libFuzzer self-stops at -max_total_time; the
   # timeout is a backstop). The build above is already cached, so this starts fast.
   ( cd "$crate_dir" && timeout $((SLICE_SECS + 60)) \
-      cargo +nightly fuzz run "$target" "$corpus" -- \
+      cargo +nightly fuzz run $feat_arg "$target" "$corpus" -- \
         -fork="$FORKS" -ignore_crashes=1 -ignore_ooms=1 -ignore_timeouts=1 \
         -max_total_time="$SLICE_SECS" -rss_limit_mb="$RSS_LIMIT_MB" \
         -timeout="$FUZZ_TIMEOUT" -artifact_prefix="$artdir" $dict_arg \

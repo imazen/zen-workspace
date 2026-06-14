@@ -33,13 +33,17 @@ SLICE_SECS="${SLICE_SECS:-600}"
 R2_ENV="${R2_ENV:-$HOME/.config/zenfuzz/r2.env}"
 FUZZ_TIMEOUT="${FUZZ_TIMEOUT:-25}"
 NPROC="$(nproc)"
-FORKS="${FORKS:-$NPROC}"
-# Peak fuzzing RSS ≈ FORKS × rss_limit. Size the per-fork cap from real RAM so a
-# fork storm can't OOM the box: reserve ~3 GB for OS + the incremental build,
-# split the rest across forks, floor 1024 MB. (16 GB box → ~1.6 GB × 8 forks.)
+# Per-fork RSS limit FIRST, then derive fork count to fit RAM. Image decoders
+# legitimately allocate ~1-2 GB for large buffers, so too LOW a per-fork limit
+# causes fork-mode FALSE OOMs (observed 2026-06-14: zenjxl decode of 16-50 byte
+# inputs flagged "OOM" at ~1.5 GB/fork but completing well under 2 GB single-
+# process — three false zenjxl-decoder issues filed+closed). Fix the limit at
+# 2 GB and derive forks so a genuine runaway (>2 GB on a fuzz input) still trips.
+RSS_LIMIT_MB="${RSS_LIMIT_MB:-2048}"
 MEM_TOTAL_MB="$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 8192)"
-RSS_LIMIT_MB="${RSS_LIMIT_MB:-$(( (MEM_TOTAL_MB - 3072) / FORKS ))}"
-[ "$RSS_LIMIT_MB" -lt 1024 ] && RSS_LIMIT_MB=1024
+FORKS="${FORKS:-$(( (MEM_TOTAL_MB - 3072) / RSS_LIMIT_MB ))}"   # reserve ~3 GB for OS + build
+[ "$FORKS" -lt 1 ] && FORKS=1
+[ "$FORKS" -gt "$NPROC" ] && FORKS="$NPROC"
 case "$(uname -m)" in
   aarch64|arm64) ARCH=arm64 ;;
   x86_64|amd64)  ARCH=x86_64 ;;

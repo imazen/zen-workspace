@@ -21,7 +21,10 @@ fi
 [ "${#HOSTS[@]}" -ge 1 ] || { echo "no fuzz boxes found (pass root@<ip> or check hcloud)" >&2; exit 0; }
 KEY="${FUZZ_SSH_KEY:-$HOME/.ssh/zen-arm-dev}"
 SRC_ZEN="${ZEN_SRC:-$HOME/work/zen}"
-EXTRA=(${FUZZ_EXTRA_REPOS:-archmage magetypes codec-corpus})   # ~/work siblings the path graph reaches
+# ~/work siblings the path-dep graph reaches. codec-corpus is a 20 GB image
+# corpus — ship ONLY its crate/ source (zencodecs fuzz path-deps it; target/ is
+# excluded so this is small). Entries may be sub-paths; structure is preserved.
+EXTRA=(${FUZZ_EXTRA_REPOS:-archmage magetypes codec-corpus/crate})
 SSHC="ssh -i $KEY -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20"
 
 # Keep .git (some build.rs read the commit hash) but drop the huge / irrelevant.
@@ -47,6 +50,7 @@ for HOST in "${HOSTS[@]}"; do
   rsync -az --info=stats1 -e "$SSHC" "${EXCL[@]}" "$SRC_ZEN/" "$HOST:work/zen/"
   for s in "${EXTRA[@]}"; do
     [ -d "$HOME/work/$s" ] || continue
+    $SSHC "$HOST" "mkdir -p 'work/$(dirname "$s")'" 2>/dev/null || true   # for sub-path entries
     rsync -az -e "$SSHC" "${EXCL[@]}" "$HOME/work/$s/" "$HOST:work/$s/"
   done
   echo "  tree synced to $HOST"

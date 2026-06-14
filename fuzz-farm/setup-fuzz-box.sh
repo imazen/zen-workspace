@@ -20,7 +20,7 @@ apt-get update -qq
 apt-get install -y --no-install-recommends \
   build-essential clang lld cmake ninja-build meson nasm yasm pkg-config \
   git curl ca-certificates python3 jq \
-  libssl-dev zlib1g-dev
+  libssl-dev zlib1g-dev libdav1d-dev
 
 log "rustup + stable + nightly"
 if ! command -v rustup >/dev/null 2>&1; then

@@ -98,8 +98,15 @@ handle_crash() { # <crate_dir> <target> <r2-key> <rel> <artifact-file>
     oom-*)                 sig="out-of-memory (libFuzzer rss limit) in $target" ;;
     leak-*)                sig="memory leak in $target" ;;
     timeout-*|slow-unit-*) sig="timeout / slow-unit in $target" ;;
-    *) sig="$(grep -m1 -E "panicked at|ERROR: libFuzzer:|SUMMARY: |ERROR: AddressSanitizer|thread '.*' panicked" "$repro_log" 2>/dev/null \
-            | sed -E 's/0x[0-9a-fA-F]+/0xADDR/g' | tr -s ' ' | head -c 200)"
+    *) # crash: dedup by panic LOCATION (file:line:col) — stable across the many
+       # inputs that reach the same bug — NOT the per-input message (which varies,
+       # e.g. "index 70 out of bounds: len 64", and would file one issue per
+       # input). Fall back to a number-masked sanitizer/libFuzzer summary, then the
+       # artifact name. Path trimmed to repo- or registry-relative.
+       sig="$(grep -m1 -oE "panicked at [^ ]+:[0-9]+:[0-9]+" "$repro_log" 2>/dev/null \
+            | head -1 | sed -E 's#.*/work/zen/##; s#.*/registry/src/[^/]+/##')"
+       [ -n "$sig" ] || sig="$(grep -m1 -E "ERROR: libFuzzer:|SUMMARY: |ERROR: AddressSanitizer" "$repro_log" 2>/dev/null \
+            | sed -E 's/0x[0-9a-fA-F]+/0xADDR/g; s/[0-9]+/N/g' | tr -s ' ' | head -c 160)"
        [ -n "$sig" ] || sig="$art_name" ;;
   esac
   local sig_hash; sig_hash="$(printf '%s\n%s\n%s' "$rel" "$target" "$sig" | sha256sum | cut -c1-16)"

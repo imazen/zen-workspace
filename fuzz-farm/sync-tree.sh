@@ -12,11 +12,13 @@
 set -euo pipefail
 # cron runs with a minimal PATH; s5cmd/hcloud live in ~/.local/bin, cargo in ~/.cargo/bin
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
-# Hosts: explicit args, else auto-resolve every purpose=fuzz box (cron-friendly;
-# picks up the ARM box automatically once it joins).
+# Hosts: explicit args, else auto-resolve every fuzz=yes box (cron-friendly;
+# picks up the ARM box automatically once it joins). fuzz=yes is the farm-
+# membership label (separate from purpose=fuzz, so the shared zen-arm-dev dev box
+# can be a member without being a deletable dedicated box).
 if [ "$#" -ge 1 ]; then HOSTS=("$@"); else
   export HCLOUD_TOKEN="$(grep -E '^api_token=' "$HOME/.config/hetzner/credentials" 2>/dev/null | head -1 | cut -d= -f2- | tr -d ' \r')"
-  mapfile -t HOSTS < <(hcloud server list -l purpose=fuzz -o noheader -o columns=ipv4 2>/dev/null | sed 's/^/root@/')
+  mapfile -t HOSTS < <(hcloud server list -l fuzz=yes -o noheader -o columns=ipv4 2>/dev/null | sed 's/^/root@/')
 fi
 [ "${#HOSTS[@]}" -ge 1 ] || { echo "no fuzz boxes found (pass root@<ip> or check hcloud)" >&2; exit 0; }
 KEY="${FUZZ_SSH_KEY:-$HOME/.ssh/zen-arm-dev}"

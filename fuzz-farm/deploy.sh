@@ -34,7 +34,7 @@ echo "ops dir updated: $OPS"
 
 # 2. every running purpose=fuzz box: push the box-runtime files + restart.
 export HCLOUD_TOKEN="$(grep -E '^api_token=' "$HOME/.config/hetzner/credentials" 2>/dev/null | head -1 | cut -d= -f2- | tr -d ' \r')"
-mapfile -t IPS < <(hcloud server list -l purpose=fuzz -o noheader -o columns=ipv4 2>/dev/null)
+mapfile -t IPS < <(hcloud server list -l fuzz=yes -o noheader -o columns=ipv4 2>/dev/null)
 if [ "${#IPS[@]}" -eq 0 ]; then
   echo "no purpose=fuzz boxes running — ops dir updated; new boxes pick it up on launch."; exit 0
 fi

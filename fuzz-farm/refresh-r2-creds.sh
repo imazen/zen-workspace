@@ -18,7 +18,7 @@ export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
 # Hosts: explicit args, else auto-resolve every purpose=fuzz box (cron-friendly).
 if [ "$#" -ge 1 ]; then HOSTS=("$@"); else
   HCTOK="$(grep -E '^api_token=' "$HOME/.config/hetzner/credentials" 2>/dev/null | head -1 | cut -d= -f2- | tr -d ' \r')"
-  mapfile -t HOSTS < <(HCLOUD_TOKEN="$HCTOK" hcloud server list -l purpose=fuzz -o noheader -o columns=ipv4 2>/dev/null | sed 's/^/root@/')
+  mapfile -t HOSTS < <(HCLOUD_TOKEN="$HCTOK" hcloud server list -l fuzz=yes -o noheader -o columns=ipv4 2>/dev/null | sed 's/^/root@/')
 fi
 [ "${#HOSTS[@]}" -ge 1 ] || { echo "no fuzz boxes found (pass root@<ip> or check hcloud)" >&2; exit 0; }
 KEY="${FUZZ_SSH_KEY:-$HOME/.ssh/zen-arm-dev}"

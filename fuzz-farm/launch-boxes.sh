@@ -37,7 +37,7 @@ create_box(){ # <name> <type>
     echo "creating $name ($stype) in $loc ..."
     if hcloud server create --name "$name" --type "$stype" --image "$IMAGE" \
         --location "$loc" --ssh-key "$SSHKEY_NAME" \
-        --label purpose=fuzz --label owner=lilith \
+        --label purpose=fuzz --label fuzz=yes --label owner=lilith \
         --user-data-from-file "$CLOUDINIT" >/dev/null 2>&1; then
       echo "  $name up in $loc"; return 0
     fi

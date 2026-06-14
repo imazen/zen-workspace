@@ -80,12 +80,26 @@ r2_push_corpus() { # <r2-key> <localdir>
 # R2 (namespaced by arch). The workstation triage maps crate_rel -> GitHub repo
 # from its own local tree and files deduplicated issues — the box stays
 # GitHub-credential-free.
-handle_crash() { # <crate_dir> <target> <r2-key> <rel> <artifact-file>
-  local crate_dir="$1" target="$2" key="$3" rel="$4" art="$5"
+handle_crash() { # <crate_dir> <target> <r2-key> <rel> <artifact-file> <feat-arg>
+  local crate_dir="$1" target="$2" key="$3" rel="$4" art="$5" feat_arg="${6:-}"
   local repro_log; repro_log="$(mktemp)"
-  ( cd "$crate_dir" && timeout 120 cargo +nightly fuzz run "$target" "$art" \
+  # Repro MUST carry the same required-features as the fuzz build, else `cargo
+  # fuzz run` rebuilds without them and fails to compile (the build cache from
+  # the fuzz slice keeps this fast). Omitting $feat_arg here is what turned 378
+  # differential_dav1d crashes into bogus build-failure "issues" on 2026-06-14.
+  ( cd "$crate_dir" && timeout 120 cargo +nightly fuzz run $feat_arg "$target" "$art" \
       -- -runs=1 -timeout="$FUZZ_TIMEOUT" -rss_limit_mb="$RSS_LIMIT_MB" ) \
       >"$repro_log" 2>&1 || true
+
+  # GUARD: a repro that fails to BUILD is not a crash. A build error (missing
+  # feature, transient breakage, toolchain skew) is not a finding — never file
+  # one. This is the belt-and-suspenders backstop to the $feat_arg threading
+  # above: even if feature detection regresses, build failures stay out of the
+  # issue tracker. Real sanitizer/panic traces never contain these markers.
+  if grep -qE "failed to build fuzz script|requires the features:|error\[E[0-9]{2,4}\]|error: could not compile|error: failed to (compile|run|build)" "$repro_log"; then
+    log "  repro BUILD-FAILED (not a crash) — skipping $rel :: $target"
+    rm -f "$repro_log"; return 0
+  fi
 
   local art_name; art_name="$(basename "$art")"
   # Signature → dedup key. Resource artifacts (oom/leak/timeout) rarely capture a
@@ -229,7 +243,7 @@ for p in m.get("packages",[]):
     [ -f "$art" ] || continue
     case "$(basename "$art")" in
       crash-*|oom-*|leak-*|timeout-*|slow-unit-*)
-        handle_crash "$crate_dir" "$target" "$key" "$rel" "$art" ;;
+        handle_crash "$crate_dir" "$target" "$key" "$rel" "$art" "$feat_arg" ;;
     esac
   done < <(find "$artdir" -type f -newer "$marker" 2>/dev/null)
   rm -f "$marker"

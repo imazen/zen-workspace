@@ -34,17 +34,48 @@ s5 sync "s3://$BUCKET/crashes/*" "$STATE/crashes/" 2>/dev/null || \
 repo_for(){ git -C "$ZEN_ROOT/$1" remote get-url origin 2>/dev/null \
   | sed -E 's#(git@github.com:|https://github.com/)##; s#\.git$##'; }
 
-filed=0; queued=0; skipped=0
+filed=0; queued=0; skipped=0; buildfail=0
 while IFS= read -r meta; do
   [ -f "$meta" ] || continue
-  sig_hash="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("sig_hash",""))' "$meta" 2>/dev/null)"
+  # Re-normalize the signature CENTRALLY here — do NOT trust the box's sig_hash.
+  # This is the dedup backstop: a box on any runner version (or a new failure
+  # mode) can't spam the tracker. We (a) DROP build failures entirely — a repro
+  # that won't compile is not a finding (378 bogus rav1d-safe issues on
+  # 2026-06-14); (b) key panics on file:line:col, stripping the per-process
+  # `thread '<unnamed>' (PID)` prefix that made every crash unique (~130 dup
+  # heic/zencodec issues); (c) collapse oom/leak/timeout per target; (d) mask
+  # addresses/numbers in sanitizer summaries.
+  IFS='|' read -r verdict sig_hash crate_rel target arch sig < <(python3 - "$meta" <<'PY'
+import json,sys,re,hashlib
+BUILD=re.compile(r"failed to build fuzz script|requires the features:|error\[E\d{2,4}\]|error: could not compile")
+LOC=re.compile(r"^\S+\.(rs|c|cc|cpp|h|cxx):\d+:\d+$")
+def trim(l): l=re.sub(r"^.*/work/zen/","",l); return re.sub(r"^.*/registry/src/[^/]+/","",l)
+try: d=json.load(open(sys.argv[1]))
+except Exception: print("SKIP|||||"); sys.exit(0)
+c=d.get("crate_rel","");t=d.get("target","");a=d.get("arch","")
+sig=(d.get("signature","") or "").strip(); blob=sig+"\n"+(d.get("trace","") or "")
+def norm():
+    if BUILD.search(blob): return None
+    m=re.search(r"panicked at (\S+?:\d+:\d+)",blob)
+    loc=m.group(1) if m else (sig if LOC.match(sig) else None)
+    if loc: return "panic "+trim(loc)
+    low=sig.lower()
+    if sig.startswith("oom") or "out-of-memory" in low: return "oom in "+t
+    if sig.startswith("leak") or "memory leak" in low: return "leak in "+t
+    if sig.startswith(("timeout","slow-unit")) or "timeout" in low: return "timeout in "+t
+    m=re.search(r"(ERROR: libFuzzer:.*|SUMMARY:.*|ERROR: AddressSanitizer.*)",blob)
+    if m: return re.sub(r"0x[0-9a-fA-F]+","0xADDR",re.sub(r"\d+","N",m.group(1)))[:160]
+    return sig[:160] or "unknown"
+ns=norm()
+if ns is None: print("SKIP|||||"); sys.exit(0)
+h=hashlib.sha256(f"{c}\n{t}\n{ns}".encode()).hexdigest()[:16]
+print(f"FILE|{h}|{c}|{t}|{a}|{ns.replace(chr(124),'/')}")
+PY
+)
+  [ "$verdict" = "FILE" ] || { buildfail=$((buildfail+1)); continue; }
   [ -n "$sig_hash" ] || continue
   grep -q "^$sig_hash	" "$LEDGER" 2>/dev/null && { skipped=$((skipped+1)); continue; }
 
-  crate_rel="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("crate_rel",""))' "$meta")"
-  target="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("target",""))' "$meta")"
-  arch="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("arch",""))' "$meta")"
-  sig="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("signature",""))' "$meta")"
   cdir="$(dirname "$meta")"
   repro="$(ls "$cdir"/crash-* "$cdir"/oom-* "$cdir"/leak-* "$cdir"/timeout-* "$cdir"/slow-unit-* 2>/dev/null | head -1)"
   repo="$(repo_for "$crate_rel")"; owner="${repo%%/*}"
@@ -103,5 +134,5 @@ while IFS= read -r meta; do
   rm -f "$body"
 done < <(find "$STATE/crashes" -name meta.json 2>/dev/null)
 
-echo "=== triage done: filed=$filed queued(manual)=$queued already-known=$skipped ==="
+echo "=== triage done: filed=$filed queued(manual)=$queued already-known=$skipped build-failures-skipped=$buildfail ==="
 [ "$queued" -gt 0 ] && echo "third-party / unknown crashes need manual review: $QUEUE"

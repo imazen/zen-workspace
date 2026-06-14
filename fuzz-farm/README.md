@@ -76,12 +76,23 @@ DRY_RUN=1 ./triage-crashes.sh
 ./kill-boxes.sh both
 ```
 
+### Deployment
+
+Scripts are version-controlled here (`zen-workspace/fuzz-farm`); the running copy
+lives at `~/work/zenfuzz-farm/`, where the crons execute from (decoupled from the
+repo checkout state). Redeploy after edits:
+`cp ~/work/zen-workspace/fuzz-farm/* ~/work/zenfuzz-farm/`.
+
 ### Recommended workstation crons
 
+`sync-tree.sh` and `refresh-r2-creds.sh` with no args auto-resolve every
+`purpose=fuzz` box, so the ARM box is picked up automatically once it joins.
+
 ```cron
-*/30 * * * *  cd ~/work/zen-workspace/fuzz-farm && ./triage-crashes.sh        >> /tmp/fuzz-triage.log 2>&1
-0    */6 * * * cd ~/work/zen-workspace/fuzz-farm && ./sync-tree.sh        $HOSTS >> /tmp/fuzz-sync.log 2>&1
-17   3  */4 * * cd ~/work/zen-workspace/fuzz-farm && ./refresh-r2-creds.sh $HOSTS >> /tmp/fuzz-cred.log 2>&1
+*/30 * * * *  cd ~/work/zenfuzz-farm && ./triage-crashes.sh   >> /tmp/fuzz-triage.log 2>&1
+23  */6 * * *  cd ~/work/zenfuzz-farm && ./sync-tree.sh        >> /tmp/fuzz-sync.log   2>&1
+37  4 */4 * *  cd ~/work/zenfuzz-farm && ./refresh-r2-creds.sh >> /tmp/fuzz-cred.log   2>&1
+*/20 * * * *  cd ~/work/zenfuzz-farm && ./bringup-arm.sh       >> /tmp/fuzz-arm.log    2>&1
 ```
 
 ## Credentials

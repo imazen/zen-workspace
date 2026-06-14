@@ -83,12 +83,22 @@ handle_crash() { # <crate_dir> <target> <r2-key> <rel> <artifact-file>
       -- -runs=1 -timeout="$FUZZ_TIMEOUT" -rss_limit_mb="$RSS_LIMIT_MB" ) \
       >"$repro_log" 2>&1 || true
 
-  local sig
-  sig="$(grep -m1 -E "panicked at|ERROR: libFuzzer:|SUMMARY: |ERROR: AddressSanitizer|thread '.*' panicked" "$repro_log" 2>/dev/null \
-        | sed -E 's/0x[0-9a-fA-F]+/0xADDR/g' | tr -s ' ' | head -c 200)"
-  [ -n "$sig" ] || sig="$(basename "$art")"
-  local sig_hash; sig_hash="$(printf '%s\n%s\n%s' "$rel" "$target" "$sig" | sha256sum | cut -c1-16)"
   local art_name; art_name="$(basename "$art")"
+  # Signature → dedup key. Resource artifacts (oom/leak/timeout) rarely capture a
+  # stable panic line on -runs=1 replay, so a per-input signature would file one
+  # issue per input for what is almost always a single bug (e.g. "huge dimensions
+  # → unbounded alloc"). Use a COARSE per-target signature for those so they
+  # collapse to one issue; keep a FINE panic/sanitizer signature for crashes.
+  local sig
+  case "$art_name" in
+    oom-*)                 sig="out-of-memory (libFuzzer rss limit) in $target" ;;
+    leak-*)                sig="memory leak in $target" ;;
+    timeout-*|slow-unit-*) sig="timeout / slow-unit in $target" ;;
+    *) sig="$(grep -m1 -E "panicked at|ERROR: libFuzzer:|SUMMARY: |ERROR: AddressSanitizer|thread '.*' panicked" "$repro_log" 2>/dev/null \
+            | sed -E 's/0x[0-9a-fA-F]+/0xADDR/g' | tr -s ' ' | head -c 200)"
+       [ -n "$sig" ] || sig="$art_name" ;;
+  esac
+  local sig_hash; sig_hash="$(printf '%s\n%s\n%s' "$rel" "$target" "$sig" | sha256sum | cut -c1-16)"
   local meta="$FUZZ_HOME/state/meta-$sig_hash.json"
 
   REL="$rel" TARGET="$target" ARCHV="$ARCH" HOSTV="$HOST" KEY="$key" \

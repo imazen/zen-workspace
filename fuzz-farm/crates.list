@@ -6,12 +6,7 @@
 # sub-crate, and the AFL-only rawloader-fork (different harness). Also excludes
 # the internal vendored jpegli-rs (zenjpeg/internal/.../jpegli) — its
 # butteraugli-oxide workspace dep won't resolve under standalone cargo-fuzz, and
-# the primary JPEG codec (zenjpeg) is already fully fuzzed. Also excludes
-# zenpipe/zencodecs (the cross-codec dispatch layer, 10 targets): its fuzz crate
-# is bit-rotted against the evolving codec APIs — fixed path/feature issues, but
-# it still hits a rav1e EncoderConfig version-skew (zenrav1e 0.1.4's cfg(fuzzing)
-# module vs newer rav1e, pulled via zenavif) that needs a dedicated dep-resync.
-# Tracked in imazen/zenpipe. The underlying codecs are all fuzzed individually.
+# the primary JPEG codec (zenjpeg) is already fully fuzzed.
 # Add a line to onboard a new crate.
 aom-decoder-rs
 fax
@@ -33,6 +28,7 @@ zengif
 zenjpeg/zenjpeg
 zenjxl-decoder
 zenpipe
+zenpipe/zencodecs
 zenpng
 zenrav1e
 zenraw

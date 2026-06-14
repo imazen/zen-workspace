@@ -44,6 +44,30 @@ EXCL=(--exclude 'target/' --exclude '.jj/' --exclude 'node_modules/'
       --exclude 'zen-sweep-worker' --exclude 'zen-metrics' --exclude 'vastai-fleet'
       --exclude '*-runner-bin' --exclude 'zen-metrics-bin')
 
+CRATES_LIST="${CRATES_LIST:-$HOME/work/zenfuzz-farm/crates.list}"
+# Overlay each fuzz crate's COMMITTED fuzz/ (origin/main) over the rsync'd copy, so
+# a repo carrying unrelated local WIP never ships a STALE harness (the rest of the
+# tree is the working copy — fast; the fuzz harnesses are always canonical). The
+# fuzz BINARY/correctness still tests whatever lib is in the working tree. git
+# archive only carries tracked files, so the box's gitignored fuzz/{corpus,target}
+# are untouched.
+overlay_canonical_fuzz() { # <host>
+  local host="$1" rel root rrel sub archpath
+  [ -f "$CRATES_LIST" ] || return 0
+  while IFS= read -r rel; do
+    rel="${rel%%#*}"; rel="$(printf '%s' "$rel" | tr -d '[:space:]')"; [ -n "$rel" ] || continue
+    [ -d "$SRC_ZEN/$rel/fuzz" ] || continue
+    root="$(git -C "$SRC_ZEN/$rel" rev-parse --show-toplevel 2>/dev/null)" || continue
+    rrel="${root#$HOME/work/}"                              # repo path under ~/work, e.g. zen/zenjpeg
+    sub="${SRC_ZEN}/${rel}"; sub="${sub#"$root"/}"          # crate path within repo
+    [ "$sub" = "$SRC_ZEN/$rel" ] && sub=""                  # crate == repo root
+    archpath="fuzz"; [ -n "$sub" ] && archpath="$sub/fuzz"
+    git -C "$root" fetch origin main -q 2>/dev/null || true
+    git -C "$root" archive origin/main "$archpath" 2>/dev/null \
+      | $SSHC "$host" "tar -x -C 'work/$rrel' 2>/dev/null" || true
+  done < "$CRATES_LIST"
+}
+
 for HOST in "${HOSTS[@]}"; do
   echo "=== sync -> $HOST ==="
   $SSHC "$HOST" 'mkdir -p ~/work/zen' || { echo "  ssh failed, skipping $HOST"; continue; }
@@ -53,5 +77,6 @@ for HOST in "${HOSTS[@]}"; do
     $SSHC "$HOST" "mkdir -p 'work/$(dirname "$s")'" 2>/dev/null || true   # for sub-path entries
     rsync -az -e "$SSHC" "${EXCL[@]}" "$HOME/work/$s/" "$HOST:work/$s/"
   done
+  overlay_canonical_fuzz "$HOST"     # canonical (origin/main) fuzz harnesses over any local WIP
   echo "  tree synced to $HOST"
 done

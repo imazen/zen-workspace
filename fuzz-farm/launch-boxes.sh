@@ -2,7 +2,7 @@
 # launch-boxes.sh — create + provision the two persistent Hetzner fuzz boxes.
 #
 #   THIS SPENDS MONEY (it is the billable step; run it deliberately):
-#     zen-fuzz-arm  cax31  8c/16GB arm64  ~€0.0296/hr  (~€15/mo monthly cap)
+#     zen-fuzz-arm  cax41  16c/32GB arm64 ~€0.0593/hr  (~€37/mo monthly cap)  [FUZZ_ARM_TYPE]
 #     zen-fuzz-x86  cpx42  8c/16GB x86     ~€0.0481/hr  (~€30/mo monthly cap)
 #   Labeled purpose=fuzz so jobdash's group=<RUN>-scoped fleet-kill never touches
 #   them. Idempotent: skips a box that already exists. Tear down: kill-boxes.sh.
@@ -70,7 +70,7 @@ case "$WHICH" in
   x86)  do_x86=1;;
   *) echo "usage: launch-boxes.sh [arm|x86|both]" >&2; exit 1;;
 esac
-[ "$do_arm" = 1 ] && { create_box zen-fuzz-arm cax31 && provision zen-fuzz-arm || echo ">> arm box not ready (stock?); rerun later: launch-boxes.sh arm"; }
+[ "$do_arm" = 1 ] && { create_box zen-fuzz-arm "${FUZZ_ARM_TYPE:-cax41}" && provision zen-fuzz-arm || echo ">> arm box not ready (stock?); rerun later: launch-boxes.sh arm"; }
 [ "$do_x86" = 1 ] && { create_box zen-fuzz-x86 cpx42 && provision zen-fuzz-x86 || echo ">> x86 box not ready; rerun later: launch-boxes.sh x86"; }
 rm -f "$CLOUDINIT"
 

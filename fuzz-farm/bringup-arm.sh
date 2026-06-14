@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# bringup-arm.sh — idempotently bring up the ARM fuzz box (cax31) the moment
-# Hetzner CAX stock returns. Built for the recurring CAX drought: run it on a
-# cron every ~20 min and it no-ops until stock appears, then creates + provisions
-# + syncs + starts fuzzing, and disarms its own cron line. Once zen-fuzz-arm is
-# up and fuzzing, every later run is a no-op.
+# bringup-arm.sh — idempotently grab a dedicated ARM fuzz box the moment Hetzner
+# ARM stock returns (default cax41 = 16c/32GB; override FUZZ_ARM_TYPE). Built for
+# the recurring CAX drought: run it on a cron every ~30 min and it no-ops until
+# stock appears, then creates + provisions + syncs + starts fuzzing, and disarms
+# its own cron line. Once zen-fuzz-arm is up and fuzzing, every later run is a
+# no-op. (ARM coverage already runs on zen-arm-dev; this adds a bigger dedicated
+# box when one becomes available.)
 #
 #   arm the retry:   (crontab -l 2>/dev/null; echo "*/20 * * * * $PWD/bringup-arm.sh >> /tmp/fuzz-arm-bringup.log 2>&1") | crontab -
 #   disarm:          crontab -l | grep -v bringup-arm.sh | crontab -

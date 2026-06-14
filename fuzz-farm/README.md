@@ -12,13 +12,21 @@ a quick local sanity pass.
 
 ## Boxes
 
-| Box | Type | Cores/RAM | Arch | ~cost (monthly cap) |
-|---|---|---|---|---|
-| `zen-fuzz-arm` | cax31 | 8 / 16 GB | arm64 | ~€15/mo |
-| `zen-fuzz-x86` | cpx42 | 8 / 16 GB | x86_64 | ~€30/mo |
+| Box | Type | Cores/RAM | Arch | Role | ~cost |
+|---|---|---|---|---|---|
+| `zen-fuzz-x86` | cpx42 | 8 / 16 GB | x86_64 | dedicated, disposable | ~€30/mo |
+| `zen-arm-dev` | cax21 | 4 / 8 GB | arm64 | shared dev box (fuzzes on an 80 GB volume) | +~€3.5/mo (volume) |
+| `zen-fuzz-arm` | cax31 | 8 / 16 GB | arm64 | optional dedicated (launch when CAX stock returns) | ~€15/mo |
 
-Persistent (never auto-killed). Labeled `purpose=fuzz` so jobdash's `group=<RUN>`
-fleet-kill never matches them. SSH: `root@<ip>` with `~/.ssh/zen-arm-dev`.
+**Labels: `fuzz=yes` = farm member** (resolved by sync-tree / refresh-r2-creds /
+deploy.sh). **`purpose=fuzz` = dedicated, disposable** (only `kill-boxes.sh`
+targets those, by name — never the shared dev box). ARM coverage currently runs
+on the small dev box `zen-arm-dev`: its root disk is full of dev work, so the
+fuzz tree + caches + `.cargo`/`.rustup` live on an attached 80 GB volume
+(`/mnt/fuzz`, symlinked from `/root/work` + `/root/fuzz-farm`), at `fork=2` +
+`MemoryMax=5G` so it stays responsive for dev/phone use. SSH: `root@<ip>` with
+`~/.ssh/zen-arm-dev`. A separate dedicated `zen-fuzz-arm` (cax31) can still be
+launched via `launch-boxes.sh arm` if you want more ARM throughput.
 
 ## How it works
 
@@ -98,14 +106,18 @@ First-time bootstrap (before deploy.sh is in the ops dir):
 ### Recommended workstation crons
 
 `sync-tree.sh` and `refresh-r2-creds.sh` with no args auto-resolve every
-`purpose=fuzz` box, so the ARM box is picked up automatically once it joins.
+`fuzz=yes` box, so a box is picked up automatically once it joins.
 
 ```cron
 */30 * * * *  cd ~/work/zenfuzz-farm && ./triage-crashes.sh   >> /tmp/fuzz-triage.log 2>&1
 23  */6 * * *  cd ~/work/zenfuzz-farm && ./sync-tree.sh        >> /tmp/fuzz-sync.log   2>&1
 37  4 */4 * *  cd ~/work/zenfuzz-farm && ./refresh-r2-creds.sh >> /tmp/fuzz-cred.log   2>&1
-*/20 * * * *  cd ~/work/zenfuzz-farm && ./bringup-arm.sh       >> /tmp/fuzz-arm.log    2>&1
 ```
+
+`bringup-arm.sh` (auto-provision a *dedicated* cax31 when CAX stock returns) is
+**not** armed by default — ARM coverage runs on `zen-arm-dev`. Arm it only if you
+want an extra dedicated ARM box:
+`*/20 * * * * cd ~/work/zenfuzz-farm && ./bringup-arm.sh >> /tmp/fuzz-arm.log 2>&1`
 
 ## Credentials
 

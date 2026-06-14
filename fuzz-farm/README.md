@@ -116,10 +116,14 @@ Per-box env (set in `zen-fuzz.service`, then `systemctl daemon-reload && restart
 
 ## Coverage
 
-28 libFuzzer crates / ~146 targets are auto-discovered (anything with
-`fuzz/fuzz_targets/*.rs` + `libfuzzer-sys` in `fuzz/Cargo.toml`). The lone AFL
-crate (`rawloader-fork`) is skipped — it needs `cargo afl`, a separate harness;
-fold it in later if wanted. `sync-tree.sh` also ships `~/work/{archmage,magetypes}`
+28 libFuzzer crates / ~111 targets are discovered via the `crates.list` allow-list
+× `cargo fuzz list` (registered `[[bin]]` targets only — so orphan/template files
+like heic's stray `fuzz_target_1.rs` are skipped, not built-and-failed). Only
+crates with `libfuzzer-sys` in `fuzz/Cargo.toml` qualify. The lone AFL crate
+(`rawloader-fork`) is skipped — it needs `cargo afl`, a separate harness; fold it
+in later if wanted. A target that fails to build (e.g. a bit-rotted one like
+zentone's `fuzz_filmic_params`, which constructs a now-`#[non_exhaustive]` struct)
+is logged and skipped, never blocking the rotation. `sync-tree.sh` also ships `~/work/{archmage,magetypes}`
 for the path-dep graph; add to `FUZZ_EXTRA_REPOS` if a build fails on a missing
 sibling.
 

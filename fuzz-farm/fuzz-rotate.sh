@@ -123,12 +123,15 @@ PY
 # and scratch/worktree copies. Either way, only crates whose fuzz/Cargo.toml uses
 # libfuzzer-sys are kept (so the AFL crate is excluded). Emits "crate_dir<TAB>target".
 emit_targets() { # <crate_dir>
-  local crate_dir="$1" rs
+  local crate_dir="$1" t
   [ -d "$crate_dir/fuzz/fuzz_targets" ] || return 0
   grep -q 'libfuzzer-sys' "$crate_dir/fuzz/Cargo.toml" 2>/dev/null || return 0
-  for rs in "$crate_dir"/fuzz/fuzz_targets/*.rs; do
-    [ -f "$rs" ] && printf '%s\t%s\n' "$crate_dir" "$(basename "$rs" .rs)"
-  done
+  # Authoritative target list = registered [[bin]] entries via `cargo fuzz list`,
+  # NOT a *.rs glob — globbing picks up orphan/template files (e.g. heic's stray
+  # fuzz_target_1.rs) that aren't bin targets and fail `cargo fuzz build`.
+  while IFS= read -r t; do
+    [ -n "$t" ] && printf '%s\t%s\n' "$crate_dir" "$t"
+  done < <(cd "$crate_dir" && cargo +nightly fuzz list 2>/dev/null)
 }
 discover() {
   local list="${CRATES_LIST:-$FUZZ_HOME/crates.list}" rel ftdir crate_dir

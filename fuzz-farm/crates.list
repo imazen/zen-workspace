@@ -14,7 +14,9 @@ heic
 image-tiff
 rav1d-safe
 ultrahdr
-weezl
+# weezl removed 2026-06-14: switched to upstream image-rs/weezl exclusively
+# (no longer a maintained fork — upstream owns LZW fuzzing). The size=0 decode
+# desync the farm found was fork-only; upstream handles it correctly.
 zenanalyze/zenpredict
 zenavif
 zenavif-parse

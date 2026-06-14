@@ -21,7 +21,7 @@ fi
 [ "${#HOSTS[@]}" -ge 1 ] || { echo "no fuzz boxes found (pass root@<ip> or check hcloud)" >&2; exit 0; }
 KEY="${FUZZ_SSH_KEY:-$HOME/.ssh/zen-arm-dev}"
 SRC_ZEN="${ZEN_SRC:-$HOME/work/zen}"
-EXTRA=(${FUZZ_EXTRA_REPOS:-archmage magetypes})   # ~/work siblings the path graph reaches
+EXTRA=(${FUZZ_EXTRA_REPOS:-archmage magetypes codec-corpus})   # ~/work siblings the path graph reaches
 SSHC="ssh -i $KEY -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20"
 
 # Keep .git (some build.rs read the commit hash) but drop the huge / irrelevant.

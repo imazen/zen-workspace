@@ -18,7 +18,7 @@ apt-get update -qq
 # Pure-Rust codecs mostly, but jpegli-cpp wants cmake+c++, dav1d/rav1e want nasm,
 # and clang/lld speed linking. ssl/zlib cover the few crates that link system libs.
 apt-get install -y --no-install-recommends \
-  build-essential clang lld cmake ninja-build nasm yasm pkg-config \
+  build-essential clang lld cmake ninja-build meson nasm yasm pkg-config \
   git curl ca-certificates python3 jq \
   libssl-dev zlib1g-dev
 

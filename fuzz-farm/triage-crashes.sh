@@ -10,6 +10,8 @@
 #
 #   DRY_RUN=1 triage-crashes.sh    # print what it would file, touch nothing
 set -uo pipefail
+# cron runs with a minimal PATH; s5cmd/hcloud live in ~/.local/bin, cargo in ~/.cargo/bin
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
 ZEN_ROOT="${ZEN_ROOT:-$HOME/work/zen}"
 STATE="${ZENFUZZ_STATE:-/mnt/v/fuzzes/_farm}"     # durable ledger + crash mirror
 LEDGER="$STATE/filed-issues.tsv"                  # sig_hash <TAB> repo <TAB> issue_url

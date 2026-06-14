@@ -8,6 +8,8 @@
 #   arm the retry:   (crontab -l 2>/dev/null; echo "*/20 * * * * $PWD/bringup-arm.sh >> /tmp/fuzz-arm-bringup.log 2>&1") | crontab -
 #   disarm:          crontab -l | grep -v bringup-arm.sh | crontab -
 set -uo pipefail
+# cron runs with a minimal PATH; s5cmd/hcloud live in ~/.local/bin, cargo in ~/.cargo/bin
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KEY="${FUZZ_SSH_KEY:-$HOME/.ssh/zen-arm-dev}"
 export HCLOUD_TOKEN="$(grep -E '^api_token=' "$HOME/.config/hetzner/credentials" | head -1 | cut -d= -f2- | tr -d ' \r')"

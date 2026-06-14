@@ -10,6 +10,8 @@
 # Excludes build output + per-target corpus/artifacts (those live in ~/fuzz-farm
 # on the box, outside the tree, so a re-sync never clobbers fuzzing state).
 set -euo pipefail
+# cron runs with a minimal PATH; s5cmd/hcloud live in ~/.local/bin, cargo in ~/.cargo/bin
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
 # Hosts: explicit args, else auto-resolve every purpose=fuzz box (cron-friendly;
 # picks up the ARM box automatically once it joins).
 if [ "$#" -ge 1 ]; then HOSTS=("$@"); else

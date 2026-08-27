@@ -126,8 +126,10 @@ ultrahdr-core = "https://github.com/imazen/ultrahdr"
 ultrahdr-rs = "https://github.com/imazen/ultrahdr"
 whereat = "https://github.com/lilith/whereat"
 zenavif = "https://github.com/imazen/zenavif"
-zenavif-parse = "https://github.com/imazen/zenavif-parse"
-zenavif-serialize = "https://github.com/imazen/zenavif-serialize"
+# zenavif-parse / zenavif-serialize are workspace members of imazen/zenavif
+# since 2026-07; the standalone repos are archived.
+zenavif-parse = "https://github.com/imazen/zenavif"
+zenavif-serialize = "https://github.com/imazen/zenavif"
 # zenanalyze repo: zenjpeg pins `zenanalyze = { git = …, rev = … }` at its
 # workspace root and path-deps `../../zenanalyze/zenpredict`. Without these
 # mappings ci-clone hits "no git URL for 'zenanalyze', skipping" — the repo

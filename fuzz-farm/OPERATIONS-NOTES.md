@@ -344,3 +344,11 @@ Also: aom-decoder-rs was archived on GitHub today (superseded by zenav1-aom)
 The ops dir had drifted ahead of this directory since 07-13 (ledger re-open
 check) and 08-10 (`--size-only` corpus sync) — landed in the parent commit,
 so `deploy.sh` no longer rolls them back.
+
+**Verified live 2026-08-28 22:40 UTC:** `deploy.sh main` → cac7d5e on all three
+boxes (zen-arm-dev, zen-fuzz-cx43, zen-arm-xl); first `sync-tree.sh` with the
+overlay: 75 crate overlays (25 crates × 3 boxes; `zenpipe` and
+`zenpipe/zencodecs` dedupe to one root), 0 `!!` lines, rc=0. Ledger:
+607 rows after reconciliation. The zentone#25/#26 NaN (Bt2446B) was the one
+LIVE bug in the 20 open fuzz issues; everything else was stale-tree
+recurrence, a June false re-file, or an unclassifiable build log.

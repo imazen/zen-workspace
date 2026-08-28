@@ -34,7 +34,73 @@ s5 sync "s3://$BUCKET/crashes/*" "$STATE/crashes/" 2>/dev/null || \
 repo_for(){ git -C "$ZEN_ROOT/$1" remote get-url origin 2>/dev/null \
   | sed -E 's#(git@github.com:|https://github.com/)##; s#\.git$##'; }
 
-filed=0; queued=0; skipped=0; buildfail=0
+
+# Ledger-hit re-open check: a signature hash in $LEDGER only proves an issue
+# was FILED for it once, not that the bug is still fixed. If the mapped issue
+# is CLOSED as COMPLETED but a crash with that exact hash was found AFTER the
+# close, that's a live regression (a narrower fix than the bug class, or a
+# re-break) — suppressing it forever hid ~10k zencodec/exif_roundtrip crashes
+# for 2.5 weeks after #30 closed (2026-06-15 fix, 2026-07-02 discovered
+# still-reproducing via manual audit; see zencodec#107).
+#
+# The mirror ($STATE/crashes) is never pruned — every run re-walks the FULL
+# history of every crash ever pulled, not just this run's new arrivals. So the
+# check can't be "is the mapped issue closed" alone, or the very act of
+# closing an issue would make every pre-existing (already-fixed, stale) mirror
+# file look like a fresh regression forever, refiling on a loop. Compare the
+# meta.json's R2 LastModified (when the box actually uploaded it, i.e. roughly
+# "when the box found this crash") against the issue's closedAt: only an
+# upload newer than the close is evidence the bug is still alive.
+#
+# Do NOT use the local file mtime for this: s5cmd sync does NOT preserve the
+# R2 object's timestamp (v2.3.0 has no such option — an earlier revision of
+# this heuristic assumed it did). Local mtime is just "when this file was
+# last (re-)synced", so any mirror re-materialization makes every closed
+# panic signature look freshly recurred — that's exactly how zencodec#113
+# got falsely re-filed on 2026-07-12 (mirror re-sync at 19:35Z, "RECURRED"
+# filing at 19:49Z, while R2 showed no upload for that box since 07-02).
+#
+# Cache lookups per-URL per run: a single sig-hash can map to thousands of
+# crash files in one pull.
+declare -A _issue_state_cache _issue_reason_cache _issue_closed_cache _r2_epoch_cache
+r2_upload_epoch(){  # $1=local mirror path -> sets R2_EPOCH to the R2 object's LastModified as epoch seconds ('' if not on R2 / lookup failed)
+  local rel="${1#"$STATE/crashes/"}" line d t
+  if [ -z "${_r2_epoch_cache[$rel]+x}" ]; then
+    line="$(s5 ls "s3://$BUCKET/crashes/$rel" 2>/dev/null | tail -1)"   # "2026/07/02 00:27:13  4749  <key>" — date/time are UTC
+    read -r d t _ <<<"$line"
+    _r2_epoch_cache[$rel]=""
+    if [ -n "${d:-}" ] && [ -n "${t:-}" ]; then
+      _r2_epoch_cache[$rel]="$(date -u -d "${d//\//-} $t" +%s 2>/dev/null || true)"
+    fi
+  fi
+  R2_EPOCH="${_r2_epoch_cache[$rel]}"
+}
+ledger_hit_is_stale_closed(){  # $1=sig_hash $2=meta.json path $3=normalized sig text -> 0 if mapped issue is CLOSED+COMPLETED AND this artifact postdates the close (don't suppress)
+  local url json meta_epoch closed_epoch
+  # oom/leak/timeout buckets are coarse-grained by design (ANY slow/OOM input
+  # for a target collapses to one hash, regardless of root cause) — the
+  # fuzzer periodically finding *some* new slow input after a perf fix isn't
+  # evidence that fix regressed, unlike a panic recurring at the exact same
+  # file:line:col. Only re-open panics.
+  [[ "$3" == "panic "* ]] || return 1
+  url="$(grep "^$1	" "$LEDGER" 2>/dev/null | tail -1 | cut -f3)"
+  [[ "$url" == http* ]] || return 1   # placeholder rows (unknown/issues-disabled) — keep suppressing
+  if [ -z "${_issue_state_cache[$url]+x}" ]; then
+    json="$(gh issue view "$url" --json state,stateReason,closedAt 2>/dev/null)"
+    _issue_state_cache[$url]="$(echo "$json" | jq -r '.state // "UNKNOWN"' 2>/dev/null)"
+    _issue_reason_cache[$url]="$(echo "$json" | jq -r '.stateReason // ""' 2>/dev/null)"
+    _issue_closed_cache[$url]="$(echo "$json" | jq -r '.closedAt // ""' 2>/dev/null)"
+  fi
+  [ "${_issue_state_cache[$url]}" = "CLOSED" ] && [ "${_issue_reason_cache[$url]}" = "COMPLETED" ] || return 1
+  [ -n "${_issue_closed_cache[$url]}" ] || return 1                       # no timestamp — don't guess, stay suppressed
+  r2_upload_epoch "$2"                       # R2 LastModified, NOT local mtime (see comment above / zencodec#113)
+  meta_epoch="$R2_EPOCH"
+  [ -n "$meta_epoch" ] || return 1           # no upload-time evidence — stay suppressed
+  closed_epoch="$(date -d "${_issue_closed_cache[$url]}" +%s 2>/dev/null)" || return 1
+  [ "$meta_epoch" -gt "$closed_epoch" ]
+}
+
+filed=0; queued=0; skipped=0; buildfail=0; reopened=0
 while IFS= read -r meta; do
   [ -f "$meta" ] || continue
   # Re-normalize the signature CENTRALLY here — do NOT trust the box's sig_hash.
@@ -74,7 +140,16 @@ PY
 )
   [ "$verdict" = "FILE" ] || { buildfail=$((buildfail+1)); continue; }
   [ -n "$sig_hash" ] || continue
-  grep -q "^$sig_hash	" "$LEDGER" 2>/dev/null && { skipped=$((skipped+1)); continue; }
+  is_regression=0
+  if grep -q "^$sig_hash	" "$LEDGER" 2>/dev/null; then
+    if ledger_hit_is_stale_closed "$sig_hash" "$meta" "$sig"; then
+      prior_url="$(grep "^$sig_hash	" "$LEDGER" | tail -1 | cut -f3)"
+      echo "  ↻ sig $sig_hash maps to CLOSED+COMPLETED $prior_url but this artifact postdates the close — treating as a regression, not suppressing"
+      is_regression=1; reopened=$((reopened+1))
+    else
+      skipped=$((skipped+1)); continue
+    fi
+  fi
 
   cdir="$(dirname "$meta")"
   repro="$(ls "$cdir"/crash-* "$cdir"/oom-* "$cdir"/leak-* "$cdir"/timeout-* "$cdir"/slow-unit-* 2>/dev/null | head -1)"
@@ -89,11 +164,19 @@ PY
        echo -e "$sig_hash\t$repo\t$target\t$arch\t$cdir" >>"$QUEUE"; queued=$((queued+1)); continue ;;
   esac
 
-  title="fuzz: ${crate_rel}::${target} crash ($sig_hash)"
+  if [ "$is_regression" = "1" ]; then
+    title="fuzz: ${crate_rel}::${target} crash ($sig_hash) — RECURRED after $prior_url"
+  else
+    title="fuzz: ${crate_rel}::${target} crash ($sig_hash)"
+  fi
   body="$(mktemp)"
   {
     echo "Found by the continuous fuzz farm (libFuzzer)."
     echo
+    if [ "$is_regression" = "1" ]; then
+      echo "**This signature was previously filed and closed as fixed at $prior_url — crashes with the identical panic location kept arriving afterward, so this is either an incomplete fix or a re-break, not a duplicate.**"
+      echo
+    fi
     echo "- **Crate**: \`$crate_rel\`"
     echo "- **Target**: \`$target\`"
     echo "- **First seen on arch**: \`$arch\`"
@@ -142,5 +225,5 @@ PY
   rm -f "$body"
 done < <(find "$STATE/crashes" -name meta.json 2>/dev/null)
 
-echo "=== triage done: filed=$filed queued(manual)=$queued already-known=$skipped build-failures-skipped=$buildfail ==="
+echo "=== triage done: filed=$filed regressions=$reopened queued(manual)=$queued already-known=$skipped build-failures-skipped=$buildfail ==="
 [ "$queued" -gt 0 ] && echo "third-party / unknown crashes need manual review: $QUEUE"

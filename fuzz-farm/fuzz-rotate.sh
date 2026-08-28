@@ -64,14 +64,23 @@ s5() {
   set -a; . "$R2_ENV"; set +a
   AWS_REGION=auto s5cmd --endpoint-url "$R2_ENDPOINT" "$@"
 }
+# Corpus filenames are libFuzzer's SHA1-of-contents, so identical name ==
+# identical bytes == identical size. That makes --size-only an exact identity
+# test here, and it is REQUIRED on both directions (measured 2026-08-10):
+#   pull: `cp` unconditionally re-downloaded the whole corpus every visit
+#         (~1.2M Class-B GetObject/day across the farm).
+#   push: s5cmd sync's DEFAULT compares size AND mtime, and the pull stamps every
+#         local file with mtime=now — always newer than the R2 object — so the
+#         default re-uploaded the ENTIRE corpus every visit (~900k Class-A
+#         PutObject/day, ~$1.5k/yr). --size-only sends only genuinely-new inputs.
 r2_pull_corpus() { # <r2-key> <localdir>
   r2_ready || return 0
   mkdir -p "$2"
-  s5 cp "s3://$R2_BUCKET/corpus/$1/*" "$2/" >/dev/null 2>&1 || true
+  s5 sync --size-only "s3://$R2_BUCKET/corpus/$1/*" "$2/" >/dev/null 2>&1 || true
 }
 r2_push_corpus() { # <r2-key> <localdir>
   r2_ready || return 0
-  s5 sync "$2/" "s3://$R2_BUCKET/corpus/$1/" >/dev/null 2>&1 || true   # additive
+  s5 sync --size-only "$2/" "s3://$R2_BUCKET/corpus/$1/" >/dev/null 2>&1 || true   # additive
 }
 
 # ── crash capture ─────────────────────────────────────────────────────────────

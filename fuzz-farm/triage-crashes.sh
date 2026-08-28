@@ -11,7 +11,7 @@
 #   DRY_RUN=1 triage-crashes.sh    # print what it would file, touch nothing
 set -uo pipefail
 # cron runs with a minimal PATH; s5cmd/hcloud live in ~/.local/bin, cargo in ~/.cargo/bin
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$HOME/.cargo/bin:/usr/local/bin:$PATH"
 ZEN_ROOT="${ZEN_ROOT:-$HOME/work/zen}"
 STATE="${ZENFUZZ_STATE:-/mnt/v/fuzzes/_farm}"     # durable ledger + crash mirror
 LEDGER="$STATE/filed-issues.tsv"                  # sig_hash <TAB> repo <TAB> issue_url
@@ -100,7 +100,7 @@ ledger_hit_is_stale_closed(){  # $1=sig_hash $2=meta.json path $3=normalized sig
   [ "$meta_epoch" -gt "$closed_epoch" ]
 }
 
-filed=0; queued=0; skipped=0; buildfail=0; reopened=0
+filed=0; queued=0; skipped=0; buildfail=0; reopened=0; unclass=0
 while IFS= read -r meta; do
   [ -f "$meta" ] || continue
   # Re-normalize the signature CENTRALLY here — do NOT trust the box's sig_hash.
@@ -113,7 +113,7 @@ while IFS= read -r meta; do
   # addresses/numbers in sanitizer summaries.
   IFS='|' read -r verdict sig_hash crate_rel target arch sig < <(python3 - "$meta" <<'PY'
 import json,sys,re,hashlib
-BUILD=re.compile(r"failed to build fuzz script|requires the features:|error\[E\d{2,4}\]|error: could not compile")
+BUILD=re.compile(r"failed to build fuzz script|requires the features:|error\[E\d{2,4}\]|error: could not compile|no bin target named|error: failed to run custom build command|error: linking with|error: failed to select a version|error: failed to load manifest|error: failed to parse manifest")
 LOC=re.compile(r"^\S+\.(rs|c|cc|cpp|h|cxx):\d+:\d+$")
 def trim(l): l=re.sub(r"^.*/work/zen/","",l); return re.sub(r"^.*/registry/src/[^/]+/","",l)
 try: d=json.load(open(sys.argv[1]))
@@ -129,16 +129,27 @@ def norm():
     if sig.startswith("oom") or "out-of-memory" in low: return "oom in "+t
     if sig.startswith("leak") or "memory leak" in low: return "leak in "+t
     if sig.startswith(("timeout","slow-unit")) or "timeout" in low: return "timeout in "+t
-    m=re.search(r"(ERROR: libFuzzer:.*|SUMMARY:.*|ERROR: AddressSanitizer.*)",blob)
+    m=re.search(r"(ERROR: libFuzzer:.*|SUMMARY:.*|ERROR: AddressSanitizer.*|ERROR: (?:Leak|Memory|Undefined|Thread)Sanitizer.*)",blob)
     if m: return re.sub(r"0x[0-9a-fA-F]+","0xADDR",re.sub(r"\d+","N",m.group(1)))[:160]
-    return sig[:160] or "unknown"
+    # Nothing recognisable: no panic location, no sanitizer / libFuzzer summary,
+    # no oom/leak/timeout artifact. The box's repro did not crash — a build that
+    # failed in a way BUILD does not list, a fork-mode-only flake, a repro run in
+    # the wrong checkout. Filing it keys the issue on the artifact's OWN NAME:
+    # one issue per artifact, forever (zenwebp#87/#88, 2026-08-23/24, were two
+    # "no bin target named demux_container" build logs). Not a finding.
+    return "UNCLASSIFIED"
 ns=norm()
 if ns is None: print("SKIP|||||"); sys.exit(0)
+if ns=="UNCLASSIFIED": print("UNCLASS|||||"); sys.exit(0)
 h=hashlib.sha256(f"{c}\n{t}\n{ns}".encode()).hexdigest()[:16]
 print(f"FILE|{h}|{c}|{t}|{a}|{ns.replace(chr(124),'/')}")
 PY
 )
-  [ "$verdict" = "FILE" ] || { buildfail=$((buildfail+1)); continue; }
+  case "$verdict" in
+    FILE) ;;
+    UNCLASS) unclass=$((unclass+1)); echo "  ?? unclassifiable repro (no panic / sanitizer signature) — not a finding, skipped: $meta"; continue ;;
+    *) buildfail=$((buildfail+1)); continue ;;
+  esac
   [ -n "$sig_hash" ] || continue
   is_regression=0
   if grep -q "^$sig_hash	" "$LEDGER" 2>/dev/null; then
@@ -225,5 +236,5 @@ PY
   rm -f "$body"
 done < <(find "$STATE/crashes" -name meta.json 2>/dev/null)
 
-echo "=== triage done: filed=$filed regressions=$reopened queued(manual)=$queued already-known=$skipped build-failures-skipped=$buildfail ==="
+echo "=== triage done: filed=$filed regressions=$reopened queued(manual)=$queued already-known=$skipped build-failures-skipped=$buildfail unclassifiable-skipped=$unclass ==="
 [ "$queued" -gt 0 ] && echo "third-party / unknown crashes need manual review: $QUEUE"

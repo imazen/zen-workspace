@@ -22,7 +22,7 @@
 #
 # (`read -rs` keeps the secret out of shell history and out of `ps`.)
 set -uo pipefail
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$HOME/.cargo/bin:/usr/local/bin:$PATH"
 
 AK="${R2_PERM_ACCESS_KEY_ID:-}"
 SK="${R2_PERM_SECRET_ACCESS_KEY:-}"

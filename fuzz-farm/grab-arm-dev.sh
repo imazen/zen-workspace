@@ -10,7 +10,7 @@
 #   arm:    (crontab -l 2>/dev/null; echo "*/30 * * * * $PWD/grab-arm-dev.sh >> /tmp/fuzz-arm-grab.log 2>&1") | crontab -
 #   disarm: crontab -l | grep -v grab-arm-dev.sh | crontab -
 set -uo pipefail
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$HOME/.cargo/bin:/usr/local/bin:$PATH"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KEY="${FUZZ_SSH_KEY:-$HOME/.ssh/zen-arm-dev}"
 NAME="${ARM_DEV_NAME:-zen-arm-xl}"

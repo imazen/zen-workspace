@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # sync-tree.sh — push the buildable workspace tree to a fuzz box. The workstation
-# is the source of truth: its committed+working tree always builds, so the boxes
-# mirror it (rather than git-cloning 60+ repos and risking path-dep commit skew).
-# Run it after provisioning and periodically (cron) to keep boxes on current code.
+# tree is the base (siblings, path deps — cheaper than git-cloning 60+ repos and
+# risking path-dep commit skew), and every crate in crates.list is then OVERLAID
+# with its pushed origin/main (or origin/master) so the farm fuzzes what is
+# committed upstream, never a checkout nobody has pulled for a week. Run it after
+# provisioning and periodically (cron) to keep boxes on current code.
 #
 #   sync-tree.sh root@<ip> [root@<ip2> ...]
 #
@@ -11,7 +13,7 @@
 # on the box, outside the tree, so a re-sync never clobbers fuzzing state).
 set -euo pipefail
 # cron runs with a minimal PATH; s5cmd/hcloud live in ~/.local/bin, cargo in ~/.cargo/bin
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$HOME/.cargo/bin:/usr/local/bin:$PATH"
 # Hosts: explicit args, else auto-resolve every fuzz=yes box (cron-friendly;
 # picks up the ARM box automatically once it joins). fuzz=yes is the farm-
 # membership label (separate from purpose=fuzz, so the shared zen-arm-dev dev box
@@ -47,26 +49,55 @@ EXCL=(--exclude 'target/' --exclude '.jj/' --exclude 'node_modules/'
       --exclude '*-runner-bin' --exclude 'zen-metrics-bin')
 
 CRATES_LIST="${CRATES_LIST:-$HOME/work/zenfuzz-farm/crates.list}"
-# Overlay each fuzz crate's COMMITTED fuzz/ (origin/main) over the rsync'd copy, so
-# a repo carrying unrelated local WIP never ships a STALE harness (the rest of the
-# tree is the working copy — fast; the fuzz harnesses are always canonical). The
-# fuzz BINARY/correctness still tests whatever lib is in the working tree. git
-# archive only carries tracked files, so the box's gitignored fuzz/{corpus,target}
-# are untouched.
-overlay_canonical_fuzz() { # <host>
-  local host="$1" rel root rrel sub archpath
+# Overlay every crates.list crate with its COMMITTED source from the repo's
+# default remote branch, so the boxes fuzz what is pushed — never the
+# workstation's working tree. Until 2026-08-28 only the fuzz/ harness was
+# overlaid: the crate SOURCE was whatever the workstation checkout held, and a
+# checkout nobody had pulled for a week made the farm re-find bugs fixed days
+# earlier on origin (aom-decoder-rs#12/#13 and zenextras#17–#20 were "RECURRED"
+# filings against exactly such stale trees). The export is rsync'd with --delete
+# so files removed upstream disappear too; the box's .git (build.rs commit
+# hashes) and its gitignored fuzz/{target,corpus,artifacts} + target/ are left
+# alone. A repo without origin/main|master, or one whose archive fails, keeps
+# the rsync'd working tree and says so.
+EXPORT="${FUZZ_EXPORT_DIR:-$HOME/tmp/fuzz-farm-export}"
+canon_ref() { # <repo-root> -> origin/main | origin/master | ""
+  local root="$1"
+  git -C "$root" fetch origin -q 2>/dev/null || true
+  if git -C "$root" rev-parse -q --verify origin/main >/dev/null 2>&1; then echo origin/main
+  elif git -C "$root" rev-parse -q --verify origin/master >/dev/null 2>&1; then echo origin/master
+  fi
+}
+overlay_canonical_crates() { # <host>
+  local host="$1" rel root rrel sub ref dest depth
   [ -f "$CRATES_LIST" ] || return 0
+  local -A seen=()
   while IFS= read -r rel; do
     rel="${rel%%#*}"; rel="$(printf '%s' "$rel" | tr -d '[:space:]')"; [ -n "$rel" ] || continue
-    [ -d "$SRC_ZEN/$rel/fuzz" ] || continue
+    [ -d "$SRC_ZEN/$rel" ] || continue
     root="$(git -C "$SRC_ZEN/$rel" rev-parse --show-toplevel 2>/dev/null)" || continue
     rrel="${root#$HOME/work/}"                              # repo path under ~/work, e.g. zen/zenjpeg
     sub="${SRC_ZEN}/${rel}"; sub="${sub#"$root"/}"          # crate path within repo
     [ "$sub" = "$SRC_ZEN/$rel" ] && sub=""                  # crate == repo root
-    archpath="fuzz"; [ -n "$sub" ] && archpath="$sub/fuzz"
-    git -C "$root" fetch origin main -q 2>/dev/null || true
-    git -C "$root" archive origin/main "$archpath" 2>/dev/null \
-      | $SSHC "$host" "tar -x -C 'work/$rrel' 2>/dev/null" || true
+    [ -n "${seen[$root|$sub]+x}" ] && continue; seen[$root|$sub]=1
+    ref="$(canon_ref "$root")"
+    [ -n "$ref" ] || { echo "  !! $rrel: no origin/main or origin/master — left as the working tree"; continue; }
+    dest="$EXPORT/$rrel${sub:+/$sub}"
+    rm -rf "$dest"; mkdir -p "$dest"
+    if [ -n "$sub" ]; then
+      depth=$(( $(printf '%s' "$sub" | tr -cd '/' | wc -c) + 1 ))
+      git -C "$root" archive "$ref" "$sub" | tar -x --strip-components="$depth" -C "$dest"
+    else
+      git -C "$root" archive "$ref" | tar -x -C "$dest"
+    fi || { echo "  !! $rrel${sub:+/$sub}: git archive $ref failed — left as the working tree"; continue; }
+    if rsync -az --delete -e "$SSHC" \
+         --exclude 'target/' --exclude 'fuzz/target/' --exclude 'fuzz/corpus/' \
+         --exclude 'fuzz/artifacts/' --exclude '.git/' \
+         "$dest/" "$host:work/$rrel${sub:+/$sub}/"; then
+      echo "  overlaid $rrel${sub:+/$sub} @ $(git -C "$root" rev-parse --short "$ref") ($ref)"
+    else
+      echo "  !! rsync overlay failed for $rrel${sub:+/$sub} — box keeps the working tree"
+    fi
   done < "$CRATES_LIST"
 }
 
@@ -79,6 +110,6 @@ for HOST in "${HOSTS[@]}"; do
     $SSHC "$HOST" "mkdir -p 'work/$(dirname "$s")'" 2>/dev/null || true   # for sub-path entries
     rsync -az -e "$SSHC" "${EXCL[@]}" "$HOME/work/$s/" "$HOST:work/$s/"
   done
-  overlay_canonical_fuzz "$HOST"     # canonical (origin/main) fuzz harnesses over any local WIP
+  overlay_canonical_crates "$HOST"   # every fuzzed crate = its pushed origin/main|master, over any local WIP/staleness
   echo "  tree synced to $HOST"
 done

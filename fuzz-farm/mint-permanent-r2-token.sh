@@ -16,7 +16,7 @@
 #   - S3 Access Key ID = the token's id; Secret = SHA-256 of the token's value
 #   - omitting expires_on entirely = never expires
 set -uo pipefail
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$HOME/.cargo/bin:/usr/local/bin:$PATH"
 set -a; . "$HOME/.config/cloudflare/r2-credentials"; set +a
 # The R2_API_TOKEN can mint TEMP creds but cannot manage tokens (9109 on every
 # token path). Minting needs the separate account-owned token that carries

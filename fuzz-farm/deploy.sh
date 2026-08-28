@@ -14,7 +14,7 @@
 # the primary zen-workspace checkout can't be `cp`'d from (it may hold unrelated
 # WIP), so we extract the chosen ref with `git archive` — no checkout needed.
 set -euo pipefail
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$HOME/.cargo/bin:/usr/local/bin:$PATH"
 REPO="${ZEN_WORKSPACE:-$HOME/work/zen-workspace}"
 OPS="${ZENFUZZ_OPS:-$HOME/work/zenfuzz-farm}"
 KEY="${FUZZ_SSH_KEY:-$HOME/.ssh/zen-arm-dev}"

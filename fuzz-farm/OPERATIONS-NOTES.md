@@ -302,3 +302,45 @@ was DISARMED (commented) at the user's direction — backup-system redesign is
 delayed; the tentative lake direction is SeaweedFS. `crontab-new.txt` +
 a dated backup in `~/tmp/fuzzbackup/` reflect the disarmed state. Do not
 re-arm without user direction. All farm crons remain active.
+
+
+## 2026-08-28 — stale-tree recurrences, unfilable repros, a cron that could not file
+
+Triaging the 20 open `fuzz:` issues from this workstation (the only host with
+`/mnt/v` + R2 creds + libdav1d) turned up three farm defects, all fixed in
+this commit:
+
+1. **The boxes fuzzed this workstation's checkout, not origin.** `sync-tree.sh`
+   rsyncs `~/work/zen` and only overlaid `fuzz/` from origin/main. Every repo
+   with a "RECURRED after <fix>" issue was 4–58 commits behind origin here
+   (aom-decoder-rs 5, zenextras 6, zentone 13, zenjxl-decoder 58), so the
+   boxes kept fuzzing pre-fix code and re-uploaded fixed signatures the day
+   after the fix landed (aom-decoder-rs#12/#13 vs e884702/09d7028;
+   zenextras#17–#20 vs 3fe603f). Replaying every artifact of those piles on
+   origin/main: 5,352 + 83 inputs, 0 panics. `overlay_canonical_crates` now
+   fetches and overlays each crates.list crate with its origin/main (or
+   origin/master — zenrav1e never got the old fuzz/ overlay because it has no
+   `main`), rsync --delete, keeping the box's .git / target / fuzz state.
+2. **Unclassifiable repros were filed under their own file name.** A repro
+   whose log had no panic, no sanitizer summary and no oom/leak/timeout
+   artifact fell through `norm()` to the artifact name — one issue per
+   artifact, forever. zenwebp#87/#88 were two `error: no bin target named
+   demux_container` build logs. `norm()` now returns UNCLASSIFIED for those
+   (counted + printed, never filed) and BUILD knows the extra cargo failures.
+3. **This host has not filed a single issue since the 08-20 migration.**
+   `gh` lives in `~/.local/share/mise/shims`, which the crons' PATH lacked, so
+   every `gh issue create` failed silently (`2>/dev/null`) — 5,849 "FAILED to
+   file … left for retry" lines in /tmp/fuzz-triage.log — and the ledger
+   re-open check's `gh issue view` failed too. All eight scripts now put the
+   mise shims on PATH. Issues filed 08-23..08-28 (zenwebp#79–#88, zentone#25/
+   #26, zenjxl-decoder#55, aom-decoder-rs#12/#13, zenextras#16–#20) came from
+   some other invocation whose ledger this host never saw; the ledger was
+   reconciled from GitHub (466 rows appended, `filed-issues.tsv.bak-2026-08-28`
+   beside it) BEFORE re-enabling filing, or the first working run would have
+   re-filed all of them as duplicates.
+
+Also: aom-decoder-rs was archived on GitHub today (superseded by zenav1-aom)
+— removed from crates.list; its two open fuzz issues cannot be closed.
+The ops dir had drifted ahead of this directory since 07-13 (ledger re-open
+check) and 08-10 (`--size-only` corpus sync) — landed in the parent commit,
+so `deploy.sh` no longer rolls them back.

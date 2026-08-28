@@ -14,7 +14,7 @@
 # token (see README "Credentials").
 set -euo pipefail
 # cron runs with a minimal PATH; s5cmd/hcloud live in ~/.local/bin, cargo in ~/.cargo/bin
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$HOME/.cargo/bin:/usr/local/bin:$PATH"
 # Hosts: explicit args, else auto-resolve every purpose=fuzz box (cron-friendly).
 if [ "$#" -ge 1 ]; then HOSTS=("$@"); else
   HCTOK="$(grep -E '^api_token=' "$HOME/.config/hetzner/credentials" 2>/dev/null | head -1 | cut -d= -f2- | tr -d ' \r')"

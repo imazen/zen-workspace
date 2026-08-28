@@ -11,7 +11,7 @@
 #   disarm:          crontab -l | grep -v bringup-arm.sh | crontab -
 set -uo pipefail
 # cron runs with a minimal PATH; s5cmd/hcloud live in ~/.local/bin, cargo in ~/.cargo/bin
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$HOME/.cargo/bin:/usr/local/bin:$PATH"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KEY="${FUZZ_SSH_KEY:-$HOME/.ssh/zen-arm-dev}"
 export HCLOUD_TOKEN="$(grep -E '^api_token=' "$HOME/.config/hetzner/credentials" | head -1 | cut -d= -f2- | tr -d ' \r')"

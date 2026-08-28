@@ -8,7 +8,9 @@
 # butteraugli-oxide workspace dep won't resolve under standalone cargo-fuzz, and
 # the primary JPEG codec (zenjpeg) is already fully fuzzed.
 # Add a line to onboard a new crate.
-aom-decoder-rs
+# aom-decoder-rs removed 2026-08-28: the repo was archived (read-only) that day —
+# superseded by zenav1-aom. Its last two fuzz findings (#12/#13) replayed clean
+# on its final main @ 09d7028 (5,352 inputs, 0 panics) and cannot be closed.
 fax
 heic
 image-tiff

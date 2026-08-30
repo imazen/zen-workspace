@@ -437,7 +437,17 @@ def select_repos(names, roots=None, all_repos=False, include_worktrees=False):
             elif os.path.isdir(n):
                 chosen.append(repo_at(n) or Repo(os.path.abspath(n), key, "git"))
             else:
-                die("no repo named %r under %s" % (n, ", ".join(roots or default_roots())))
+                # Named a worktree/jj-workspace dir that the default scan folds
+                # away (rav1d-safe--census, zenavif--encode-rd). Look again.
+                hit = None
+                for root in (roots or default_roots()):
+                    cand = os.path.join(root, os.path.basename(os.path.normpath(n)))
+                    if os.path.isdir(cand):
+                        hit = repo_at(cand)
+                        break
+                if hit is None:
+                    die("no repo named %r under %s" % (n, ", ".join(roots or default_roots())))
+                chosen.append(hit)
         return chosen
     if not all_repos:
         repos = [r for r in repos if r.owned]
@@ -961,9 +971,15 @@ def cmd_red(argv):
     fresh = "--fresh" in opts
     limit = int(opts.get("--limit", 60))
 
+    unchecked = []
+
     def scan(repo):
         data = fetch_runs(repo, per_page=limit, fresh=fresh)
         if "_error" in data:
+            # Never silently drop a repo we could not read: "nothing red" and
+            # "could not look" are different answers.
+            if data["_error"] not in ("no github remote", "no trunk detected"):
+                unchecked.append((repo.name, data["_error"]))
             return (repo, [])
         groups = group_by_workflow(data.get("workflow_runs") or [], "--include-bots" in opts)
         reds = []
@@ -1008,8 +1024,15 @@ def cmd_red(argv):
 
     reds_all = pmap(enrich, reds_all, workers=8)
 
+    def _unchecked_footer():
+        if unchecked:
+            print(yellow("%d repo(s) could not be checked:" % len(unchecked)))
+            for nm, e in unchecked[:8]:
+                print("  %-24s %s" % (nm, dim(short(e, 80))))
+
     if not reds_all:
         print(green("all clear") + dim(" — %d repos, no failing workflow on trunk" % len(repos)))
+        _unchecked_footer()
         return 0
     width = term_width()
     for repo, reds in reds_all:
@@ -1056,6 +1079,7 @@ def cmd_red(argv):
                 print("      " + dim(r["html_url"]))
     print()
     print(red("%d repo(s) red" % len(reds_all)) + dim(" of %d scanned" % len(repos)))
+    _unchecked_footer()
     return 1
 
 
@@ -1149,13 +1173,27 @@ def cmd_verify(argv):
         return 0
     repo = repo_arg([opts["--repo"]] if "--repo" in opts else [])
     is_jj = os.path.exists(os.path.join(repo.path, ".jj"))
-    rev = args[0] if args else ("@-" if is_jj else "HEAD")
+    chose = ""
+    if args:
+        rev = args[0]
+    elif is_jj:
+        # Both jj workflows are in use here: "jj new; edit; bookmark set main
+        # -r @" leaves the work in @, while "edit; jj new" leaves it in @-.
+        # Pick whichever of the two actually has content, and say which.
+        wc = jj_head_commit(repo)
+        if wc and not wc["empty"]:
+            rev, chose = "@", "(@ has content)"
+        else:
+            rev, chose = "@-", "(@ is empty, so the work is in @-)"
+    else:
+        rev = "HEAD"
     if "--fetch" in opts:
         _fetch_origin(repo)
     sha = resolve_commit(repo, rev)
     ok = True
 
-    print(bold("%s  %s  (trunk: %s)" % (repo.name, sha[:12], repo.trunk or "?")))
+    print(bold("%s  %s  (trunk: %s)" % (repo.name, sha[:12], repo.trunk or "?"))
+          + (dim("  verifying %s %s" % (rev, chose)) if chose else ""))
 
     subject = out(["git", "log", "-1", "--format=%s", sha], cwd=repo.path)
     body_ok = bool(subject.strip()) and subject.strip() != "(no description set)"
@@ -1249,7 +1287,7 @@ def dirty_state(repo):
         for line in so.splitlines():
             if line.startswith("Working copy changes:"):
                 continue
-            if re.match(r"^[AMDR]\s", line):
+            if re.match(r"^[AMDRC]\s", line):  # add/mod/del/rename/conflict
                 lines.append(line.strip())
             if line.startswith(("Working copy ", "Parent commit")):
                 break

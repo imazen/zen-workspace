@@ -523,6 +523,11 @@ def resolve_commit(repo, rev, soft=False):
             return alt
         msg = ("%r looks like jj ref syntax (name@remote). git needs %r, which does not exist here.\n"
                "       jj: `jj log -r %s`   git: `git show %s`" % (rev, git_form, rev, git_form))
+        # Two traps usually fire together: jj syntax AND the wrong trunk name.
+        if repo.trunk and repo.trunk != m.group("name"):
+            msg += ("\n       note: %s's trunk is %r, not %r — try %s@%s / %s/%s"
+                    % (repo.name, repo.trunk, m.group("name"), repo.trunk, m.group("remote"),
+                       m.group("remote"), repo.trunk))
         if soft:
             warn(msg)
             return None

@@ -125,10 +125,12 @@ repo and `forbid` in `zenutils`. First-wins would silently downgrade a safety li
 **U7 — a symlinked repo alias is a lockfile collision.** `~/work/butteraugli` is a symlink
 to `~/work/zen/butteraugli`; cargo does not canonicalize path deps, so
 `../../butteraugli/butteraugli` and `../../zen/butteraugli/butteraugli` are two different
-packages with the same name: `error: package collision in the lockfile`. **5 live manifests
-do this** (`jxl-encoder`, `zenjxl`, `zenmetrics` ×2, `zensim/zensim-target`). Invisible
-today because each repo has its own lock. `zen unify doctor` reports it; `--workspace`
-rewrites them reversibly.
+packages with the same name: `error: package collision in the lockfile`. **Live tree: 10
+such path deps across 6 manifests** — `jxl-encoder`, `zenjxl`, `zenmetrics` ×2,
+`zensim/zensim-target` (all via `butteraugli`), `imageflow-server-rs/…/imageflow-async-ffi`
+×2 (via `enough`), and `zenimage` ×4 (via `imageflow`). Invisible today because each repo
+has its own lock. `zen unify doctor` reports it; `--workspace` rewrites them reversibly.
+These are one-line fixes worth making at the source regardless of any of this.
 
 **U8 — one lock is not one version.** With everything claimed, the unified graph is
 **110 members / 1,072 packages**, and **108 crate names resolve at ≥2 versions**, including
@@ -164,11 +166,14 @@ Three layers, each independently on/off, cheapest first (`zen unify`, `bin/READM
 1. **`--patch`** — one `.cargo/config.toml` above the repos. No manifest touched, reaches
    the 101 nested sub-workspaces (T5/T6), undo is `rm`. This is still the best
    value-per-risk in the tree and does not depend on anything below it.
-2. **`--workspace`** — the parent `Cargo.toml`. One lock for what it can claim
-   (17 repos / 30 crates without layer 3).
-3. **`--materialize`** — de-inherit member manifests, which unblocks the remaining 11 repos
-   / 79 crates. Reversible; `off` restored 211 manifests byte-identically after a full
-   build cycle. **Do not commit while it is on** — `zen unify status` says so in red.
+2. **`--workspace`** — the parent `Cargo.toml`. One lock for what it can claim.
+   **Live tree today: 41 repos / 68 crates**, with git worktrees and jj workspaces
+   excluded (they hold a second copy of every crate name).
+3. **`--materialize`** — de-inherit member manifests, which unblocks the remaining
+   **20 repos / 176 crates** on the live tree. Reversible; `off` restored every rewritten
+   manifest byte-identically after a full on → resolve → build → off cycle on the 30-repo
+   mirror (211 manifests checked, 0 mismatches). **Do not commit while it is on** —
+   `zen unify status` says so in red.
 
 Plus the two fixes the second pass found are needed regardless of any of the above: the
 **5 alias-crossing path deps** (U7) and the advisory **registry-truth workflow** (U9).

@@ -252,6 +252,14 @@ into the previous change, so the change you then describe and push goes out
 `72bb4181` in jxl-encoder, both real, both zero files, both caught by
 `zenverify` when pointed at them after the fact. Non-emptiness is a hard check.
 
+It also fired *while these tools were being written*: an `rm` plus a
+`.gitignore` append ran before `jj new`, the edits landed in the parent change,
+and the described commit came out empty. That is why `zenverify` with no
+argument checks `@` when `@` has content and `@-` when it does not, and prints
+which one it picked — a fixed default is wrong for one of the two jj workflows
+in use here. In the same session its changed-path list caught a stray
+`__pycache__/*.pyc` that had just been committed.
+
 **GitHub job logs are timestamp-prefixed and ANSI-coloured.** A line reads
 `2026-08-29T19:48:54.4505924Z \x1b[1m\x1b[91merror\x1b[0m: using …`, so
 `grep '^error'` matches nothing and you conclude the log is clean. Both are

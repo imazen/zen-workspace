@@ -3,3 +3,7 @@ CONTEXT-HANDOFF.md
 # Per-agent activity marker
 .workongoing
 .jj/
+
+# Python bytecode from bin/zen
+__pycache__/
+*.pyc

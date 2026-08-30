@@ -1,17 +1,177 @@
 # Zen crate tree: one workspace, or targeted fixes? — 2026-08-30
 
-**Question asked:** could a unified single Rust workspace fix the dependency mess when
-co-developing this crate tree, and can git/jj workspaces help? Constraints: reuse what
-we can, keep it simple, make it faster to iterate across machines.
+> ## CORRECTED 2026-08-30 (second pass) — read [§0](#0-what-this-document-got-wrong) first
+>
+> The first pass **answered the wrong question** (it studied merging the repos into a
+> monorepo; nobody asked for that) and **reached a false blocker** (T4). A second pass
+> built the thing and measured it at scale over 30 real repos. What survives, what is
+> refuted, and the new blockers are in [§0](#0-what-this-document-got-wrong). Corrected
+> claims below are marked **[CORRECTED]**; new ones carry IDs **U1–U10**.
 
-**Answer: no — don't build the monorepo. Three targeted fixes get most of the benefit,
-and most of the tooling to do them already exists in this repo and is simply not wired
-up.** The one problem a monorepo would fix structurally (version skew) is real and I do
-not want to hand-wave it; see [§9 The strongest argument against this recommendation](#9-the-strongest-argument-against-this-recommendation).
+**Question actually asked:** put a parent folder over the existing repo directories
+carrying **one unified `Cargo.toml`**, so there is one lock and one resolution — **no git
+history merged, every repo stays its own repo** — plus a manifest so a second machine gets
+the whole tree in one command, and a separate non-blocking CI job that tests against the
+real published dependency graph.
+
+**Answer: build it, in three independently reversible layers, and stop treating it as a
+monorepo decision.** A parent workspace *can* claim crates out of repos that are still
+workspace roots themselves — the first pass's central blocker was wrong. The genuine
+blocker is `[workspace.package]` / `[workspace.dependencies]` inheritance, which needs the
+*member* manifests rewritten, not the repo roots hidden. All of it is implemented as
+`zen unify` (`bin/zen`, `bin/README.md`).
 
 Everything below was measured on 2026-08-30 against the tree on this Mac (`cargo 1.98.0`,
-`rustc 1.98.0`). Cargo-semantics claims carry a test ID (T1–T11) and are reproducible from
-[§10](#10-reproducing-the-cargo-semantics-tests). Nothing outside `~/tmp` was modified.
+`rustc 1.98.0`). Cargo-semantics claims carry a test ID (T1–T11, U1–U10). Nothing outside
+`~/tmp` was modified; the second pass ran against `git archive` copies of 30 real repos.
+
+---
+
+## 0. What this document got wrong
+
+**Wrong question.** §4/§9 evaluate "merge 73 repos into a monorepo", weigh git history,
+upstream forks, and CLA concerns, and recommend against it. None of that was asked. The
+request was a **parent directory with one `Cargo.toml` over the repos as they sit**. No
+history moves, no repo is absorbed, every repo keeps its own remote and CI. Most of §4's
+cost analysis survives as *workspace* cost; all of its *repository* cost is irrelevant.
+
+**Refuted: T4, the "37 manifests must stop being workspace roots" blocker.**
+`error: multiple workspace roots found in the same workspace` fires only when a manifest
+that is **itself a member** also declares `[workspace]`. Listing a repo's **leaf crates**
+does not trip it, and the repo keeps building standalone. See **U1**/**U4**. Nothing had
+to be hidden for the 22 virtual roots. The 23 package+workspace hybrid roots do lose their
+*root package* from the unified view (**U4**) — that is the real, much smaller version of
+the finding.
+
+**Refuted: "one lock means one version, full stop" (§4 #4).** Measured on the real unified
+graph: **108 crates resolve at two or more versions inside the single lock**, including our
+own — `zenjxl-decoder 0.3.10` came from crates.io while `0.4.0` sat in the same workspace as
+a member. See **U8**. A unified workspace does **not** make version skew structurally
+impossible; it makes it *centrally visible*, which is the same thing the config-table
+recommendation offered. The strongest argument in §9 therefore does not hold as written.
+
+**Refuted in effect: the registry-truth gate in §10 step 3.** `cargo publish --dry-run`
+verifies **inside** the tree, so the shared patch table it also recommends silently defeats
+it. See **U9**. The gate has to build the packaged crate *outside* the tree.
+
+**Missed entirely:** inheritance (**U5**, the actual blocker), path-dep auto-membership
+(**U2**/**U3**), symlinked repo aliases colliding in one lock (**U7**), profile
+consolidation (**U10**), and that `cargo superwork setup` — named in §6 as the
+cross-machine answer — recovers **10 of 64 repos** on a fresh machine (**§6, corrected**).
+
+**Survives unchanged:** T1, T2, T3, T5, T6, T7, T8, T10, T11; the `superwork check`
+false-positive diagnosis (§8) — still the highest-leverage one-hour fix; the patch-conflict
+audit and its counts (§1, §5); the CI clone-step counts and floating-branch analysis (§4
+#2/#3); the cost data (§4, §7). **T6 was re-verified independently**: a nested standalone
+`fuzz/` workspace picks up a parent `.cargo/config.toml` `[patch.crates-io]` and fails
+without it.
+
+### U1–U10 — what a parent workspace actually does, measured at scale
+
+Fixtures in `~/tmp/uwscale`; the scale run is a 30-repo `git archive` mirror at
+`~/tmp/uwscale/work`, laid out exactly like `~/work` (two levels: `work/` and `work/zen/`).
+
+**U1 — a parent workspace may claim crates out of repos that are still workspace roots.**
+`members = ["zen/butteraugli/butteraugli", …]` with `zen/butteraugli/Cargo.toml` still
+carrying its own `[workspace]` resolves and compiles. From inside the repo the root is the
+repo; from the parent it is the parent. Both views coexist. **This is the property the
+request needs, and it works.**
+
+**U2 — a path dependency that lands inside the parent's directory is auto-added as a
+member.** So a claimed crate that path-deps into an unclaimed repo drags that repo's crate
+into the parent workspace, where its inheritance resolves against the wrong root. This is
+why the naive parent manifest fails on the *second* repo, not the first.
+
+**U3 — `exclude` is the escape hatch, and explicit `members` beat `exclude`.** Excluding a
+repo directory keeps its crates owned by their own root even when path-dep'd. An explicit
+`members` entry under an excluded directory is still claimed. `zen unify` therefore
+**excludes every repo directory** and lists exactly the crates it claims. This also handles
+the 24 plain-package repo roots, which would otherwise hard-error with *"current package
+believes it's in a workspace when it's not"* the moment a parent `Cargo.toml` exists.
+
+**U4 — a hybrid `[package]`+`[workspace]` root cannot be a member.** Claiming it gives
+`multiple workspace roots found in the same workspace`; the `[workspace]` table travels
+with the package. Tree-wide: **23 hybrid roots** (15 canonical + 8 `rav1d-safe--*` jj
+workspaces), including `zenanalyze`, `zenpipe`, `zenavif`, `zencodec`, `zenrav1e`, `heic`.
+Their *leaves* join fine; their *root package* stays out. A hybrid root that lists `"."`
+among its own members (`heic`, `zenrav1e`) must have that entry dropped.
+
+**U5 — [THE REAL BLOCKER] a member cannot inherit from a root that is not its workspace
+root.** `version.workspace = true` under a parent root gives
+`error inheriting `version` … `workspace.package.version` was not defined`. Tree-wide:
+**17 repos declare `[workspace.package]`, 14 declare `[workspace.dependencies]` (311
+entries), 5 declare `[workspace.lints]`, and 181 member manifests inherit.**
+
+Merging those tables into the parent is **not possible**, and this is the decisive
+measurement: unioning `[workspace.package]` across just three repos collides on
+`version` (`0.9.4` / `0.4.0` / `0.1.0`), `license` (BSD-3-Clause vs AGPL-3.0), `repository`,
+`homepage`, `authors` and `rust-version`. Whichever wins, the other repos' crates get the
+wrong version and licence baked in — including into published `.crate` files.
+
+**So this — not "stop being a workspace root" — is where rewriting is required, and it is
+the *member* manifests that must change, not the repo roots. Hiding a repo root makes it
+strictly worse: it deletes the table its own members read.** `zen unify --materialize`
+substitutes each inherited key with the literal value from that crate's **own** root. The
+result is valid under *both* roots, so a half-finished toggle never leaves a repo
+unbuildable (verified: materialized manifests build standalone with the parent manifest
+deleted). Measured on the 30-repo mirror: **70 manifests rewritten, 11 blocked repos
+unblocked, restored byte-identical afterwards (211 manifests, 0 mismatches).**
+
+**U6 — `lints.workspace = true` fails the same way** and is the one table that *can* be
+merged — except when it can't: the real tree collides on `rust.unsafe_code`, `allow` in one
+repo and `forbid` in `zenutils`. First-wins would silently downgrade a safety lint.
+`--materialize` gives each member its own copy and removes the question.
+
+**U7 — a symlinked repo alias is a lockfile collision.** `~/work/butteraugli` is a symlink
+to `~/work/zen/butteraugli`; cargo does not canonicalize path deps, so
+`../../butteraugli/butteraugli` and `../../zen/butteraugli/butteraugli` are two different
+packages with the same name: `error: package collision in the lockfile`. **5 live manifests
+do this** (`jxl-encoder`, `zenjxl`, `zenmetrics` ×2, `zensim/zensim-target`). Invisible
+today because each repo has its own lock. `zen unify doctor` reports it; `--workspace`
+rewrites them reversibly.
+
+**U8 — one lock is not one version.** With everything claimed, the unified graph is
+**110 members / 1,072 packages**, and **108 crate names resolve at ≥2 versions**, including
+`archmage 0.4.0 + 0.9.28`, `zensim 0.2.7 + 0.3.0`, `zenrav1e 0.1.4 + 0.2.0`,
+`zenresize 0.2.2 + 0.3.1`, `ultrahdr-core 0.4.1 + 0.5.0`, `zenavif-parse 0.6.2 + 0.7.0`,
+`zenpredict 0.2.0 + 0.2.1`. Membership alone redirects nothing: `jxl-encoder` requires
+`zenjxl-decoder ^0.3.8`, the member on disk is `0.4.0`, so cargo took registry `0.3.10` —
+the same inert-patch failure §4 documents, now inside one lock. **A unified workspace does
+not fix problem #4; it relocates it.** What it does fix is *one place to look*.
+
+**U9 — `cargo package` / `cargo publish --dry-run` is not registry truth under a shared
+patch table.** The verify build unpacks into `<repo>/target/package/…`, which is inside the
+tree, so cargo walks up and finds the ancestor `.cargo/config.toml`. Packaging
+`butteraugli-cli 0.9.4`, which requires `butteraugli ^0.9.4` against a crates.io maximum of
+`0.9.3`, **passed in-tree** — "Compiling butteraugli v0.9.4 (…/zen/butteraugli/butteraugli)".
+The identical `.crate` extracted outside the tree failed correctly. The advisory workflow is
+committed at `ci-registry-truth.yml`; the only thing that matters in it is *where* it builds.
+
+**U10 — profiles consolidate to exactly one body.** 39 repos declare root `[profile.*]`;
+**18 distinct profile names, 4 of which conflict**: `release` (31 repos, 15 distinct
+bodies), `dev` (21/10), `bench` (16/7), `test` (8/2). Under one parent root only the
+parent's profiles apply and every other repo's are ignored with a warning — 9 such warnings
+on every cargo invocation anywhere in the mirror. The 14 non-conflicting custom names
+(`checked-release`, `opt-dev`, `release-fat`, `gpu-citest`, …) are referenced by justfiles
+and CI via `--profile <name>` and must be carried into the parent or those commands break.
+Also measured: **0 repos use `default-members`**, so a bare `cargo build` at the parent
+builds all 110 members — always scope with `-p`.
+
+### What to do
+
+Three layers, each independently on/off, cheapest first (`zen unify`, `bin/README.md`):
+
+1. **`--patch`** — one `.cargo/config.toml` above the repos. No manifest touched, reaches
+   the 101 nested sub-workspaces (T5/T6), undo is `rm`. This is still the best
+   value-per-risk in the tree and does not depend on anything below it.
+2. **`--workspace`** — the parent `Cargo.toml`. One lock for what it can claim
+   (17 repos / 30 crates without layer 3).
+3. **`--materialize`** — de-inherit member manifests, which unblocks the remaining 11 repos
+   / 79 crates. Reversible; `off` restored 211 manifests byte-identically after a full
+   build cycle. **Do not commit while it is on** — `zen unify status` says so in red.
+
+Plus the two fixes the second pass found are needed regardless of any of the above: the
+**5 alias-crossing path deps** (U7) and the advisory **registry-truth workflow** (U9).
 
 ---
 
@@ -79,7 +239,8 @@ So `members = ["../zenjpeg/zenjpeg"]` is dead. **The naive dev-umbrella is impos
 hierarchy rule with no git history moved. That is the only shape a monorepo-without-a-merge
 could take.
 
-**T4 — …except every member must first stop being a workspace root.**
+**T4 — [CORRECTED — this was the false blocker] the error fires only for a manifest that is
+itself a member.**
 
 ```
 error: multiple workspace roots found in the same workspace:
@@ -88,9 +249,19 @@ error: multiple workspace roots found in the same workspace:
   /Users/lilith/tmp/wsproto2
 ```
 
-That is **37 root manifests** that must lose `[workspace]` (and with it their members globs,
-`exclude` lists, `workspace.dependencies` and profiles), after which **none of them builds
-standalone**. This is the real price of A, and it is not small.
+The original fixture listed the **repo directories** as members. That is not the shape the
+request needs. Listing a repo's **leaf crates** —
+`members = ["repoA/leaf1", "repoB/leaf2"]` with `repoA/Cargo.toml` still declaring
+`[workspace]` — resolves and compiles, and the repo still builds standalone (**U1**).
+
+The claim "**37 root manifests must lose `[workspace]`, after which none of them builds
+standalone**" is **wrong**. Nothing has to be hidden for the 22 virtual roots. What is true
+is much narrower: the **23 hybrid `[package]`+`[workspace]` roots** cannot contribute their
+*root package* to the unified workspace, because the `[workspace]` table travels with the
+package (**U4**). Their leaves join normally.
+
+The real price of a parent workspace is **U5** (inheritance), which this document missed
+entirely, and it is paid in *member* manifests, not repo roots.
 
 **T2 — A symlink farm does not rescue it.** Cargo resolves a member's relative path deps
 against the *symlink* location, not the real directory:
@@ -155,8 +326,17 @@ floats**, so a push to `imazen/zenanalyze` can turn `zenjpeg` red with no zenjpe
 What replaces it in CI: path-filtering (`paths:` / `dorny/paths-filter`) plus `-p` scoping,
 which you need anyway to avoid T10's feature unification.
 
-**#4 version skew — yes, structurally, and this is the monorepo's best argument.** One lock
-means one version, full stop. Today `rav1d-safe` is resolved as **five distinct builds
+**#4 version skew — [CORRECTED] no. This was the strongest claim in the document and it is
+false.** "One lock means one version, full stop" does not hold: cargo locks semver-
+incompatible versions of the same crate side by side, workspace member or not. Measured on
+the real unified graph (**U8**): **108 crate names at ≥2 versions in one lock**, and
+`jxl-encoder` still resolved `zenjxl-decoder 0.3.10` from crates.io while member `0.4.0` sat
+in the same workspace — because `^0.3.8` cannot be satisfied by `0.4.0` and **membership
+redirects nothing**. A unified workspace centralises skew; it does not eliminate it. The
+rest of this subsection — the measurements — stands, and is now the argument for *detecting*
+skew rather than for the topology.
+
+Today `rav1d-safe` is resolved as **five distinct builds
 simultaneously** — three git revs (`66f58fa6`, `140f9145`, `f6aed27e`) plus registry `0.5.7`
 and `0.5.5`. The rev `140f9145` is named in **no manifest at all**; it arrives transitively
 through a `zenavif` git patch and is locked in 8 places. Four lockfiles
@@ -211,8 +391,14 @@ Plus `jpegli` (a direct `google/jpegli` clone, not even a fork), the data repos
 release cadence — `archmage`/`magetypes` most sharply, since `magetypes 0.9.28` is precisely
 what breaks published `jxl-encoder-simd`.
 
-**Verdict on A:** it fixes #2/#3/#4/#6, does not fully fix #1, makes #5 worse, does nothing
-for #7, and costs 37 manifest restructurings after which no repo builds standalone.
+**Verdict on A: [CORRECTED].** A parent workspace fixes **#2/#3** (nothing to clone, one
+branch) and **#6**; it **does not fix #4** (U8: 108 crates at ≥2 versions in one lock, our own
+included); it does not fully fix **#1** (the 101 sub-workspaces are not members — the config
+table reaches them, T6); it does not make **#5** worse than the config table already does, and
+the advisory gate answers it either way (U9); it does nothing for **#7**. The cost is **not**
+37 root restructurings — it is 181 member manifests de-inherited reversibly (U5), 23 hybrid
+root packages left out (U4), one profile body surviving out of 4 conflicting names (U10), and
+5 alias-crossing path deps that must be fixed first (U7).
 
 ---
 
@@ -315,9 +501,28 @@ Of the cross-repo alternatives:
 - **Submodules / `git subtree`** — solve "get the right revisions together", but pin every
   sibling explicitly, so the daily edit-two-repos-at-once loop becomes a pointer-bump per
   edit. Worse for iteration speed, which is the stated goal.
-- **A repo-manifest tool** — the right answer, and **it already exists here**:
-  `Superwork.toml` with `scan_dirs`/`extra_roots` plus `cargo superwork setup`
-  ("Clone all ecosystem repos on a new machine").
+- **A repo-manifest tool** — the right answer, and the tool exists — **but [CORRECTED] it
+  does not work on a fresh machine.** `cargo superwork setup` builds its list from the ten
+  `[[repo]]` entries in `Superwork.toml` *plus a scan of the local filesystem*, and
+  `scan_roots` silently drops scan dirs that do not exist. **Measured: 64 repos on this
+  populated machine, 10 with an empty scan dir — i.e. 10 of 64 (16%) on a new box.** Three
+  further defects in the populated run, all verified: it would try to clone the jj workspace
+  `../zen/zenavif--encode-rd` from a URL that 404s; the **real `zenavif` repo is absent from
+  all 64 lines** (the scan is keyed by crate name, so the jj workspace shadowed its parent);
+  and five `[[repo]] dir` values (`fax`, `image-tiff`, `ravif`, `whereat`, `zenimage`) lack
+  the `../zen/` prefix, so they resolve next to `zen-workspace` and are reported as both
+  *exists* and *clone*. Until `[[repo]]` carries the full repo→URL list, "one command gets
+  the tree" is not true.
+- **`git-workspace` (orf/git-workspace)** — evaluated, **skip it.** Healthy project
+  (1.11.0, released 2026-08-07) but structurally unable to express this tree: its manifest
+  holds only `[[provider]]` blocks (`github`/`gitlab`/`gitea`) resolved through a live org
+  GraphQL query — `ProviderSource` has **no explicit repo-list variant** — and its layout is
+  hard-coded to `<path>/<owner>/<name>`, so it produces `github/imazen/zenjpeg`, not
+  `work/zen/zenjpeg`. It has no rev pinning (`git-workspace lock` locks the repo *set*, not
+  revisions), and knows nothing about cargo. Adopting it would add a third tool and a second
+  source of truth to buy parallel clone and archival. **The minimum-new-tooling answer is to
+  promote `Superwork.toml`'s `[[repo]]` table to the full repo list** — the URLs are already
+  90% present in `[ci.patch_repos]` — and fix the three `setup` defects above.
 - **Sparse / partial clone** — solves a size problem this tree does not have (§7).
 
 ---
@@ -333,7 +538,9 @@ The cost is smaller than it looks, and it is not the git.
   shrinks it** (T11 verified reuse; 2.45× duplication measured).
 
 So: `cargo superwork setup` for the clone, one shared `CARGO_TARGET_DIR`, and one shared
-`.cargo/config.toml`. That is the whole per-machine cost.
+`.cargo/config.toml`. That is the whole per-machine cost — **[CORRECTED] once `setup` is
+fixed. Measured today it recovers 10 of 64 repos on an empty machine** (see §6). The clone
+step is the part of this plan that is currently not true.
 
 The genuine cross-machine blocker is different and already present: **15 broken sibling path
 deps**, three of which are hard-coded foreign absolute paths that can never resolve here —
@@ -390,8 +597,17 @@ path breakage.
 
 ## 9. The strongest argument against this recommendation
 
-**The monorepo makes correctness structural; my recommendation makes it discipline-dependent
-— and the discipline has already failed, repeatedly, in writing.**
+> **[CORRECTED]** This section's premise — "under one workspace this class of failure cannot
+> occur … one lock [means one version]" — is **half right**. The *clone-step* failure it
+> opens with genuinely cannot occur under a parent workspace: there is nothing to clone.
+> The *version-skew* half is refuted by **U8** (108 crates at ≥2 versions in one lock).
+> Read the incident below as the argument for **layer 2 of `zen unify` plus a believable
+> `superwork check`**, not as an argument for merging repositories — which is not what was
+> asked and would not have fixed the skew either.
+
+**One workspace makes the clone-step failure structural; the recommendation as first written
+makes it discipline-dependent — and the discipline has already failed, repeatedly, in
+writing.**
 
 `zenmetrics` master is red right now. Three path deps on `zenav1-aom` landed in commit
 `2690d66e` (2026-08-30 05:17Z); `ci.yml` mentions `zenav1-aom` **zero times**; all 9 jobs die
@@ -415,11 +631,18 @@ clone, nothing to pin, and one lock. Three repos are red today for reasons a mon
 make unrepresentable (`zenmetrics`, `zenimage`, `imageflow-server-rs`), and a fourth
 (`glassa`) is latently broken.
 
-**Why I still recommend against it.** The monorepo trades a failure mode that is *loud,
-local, and caught within minutes by CI* for one that is *silent and reaches users* — verified
-today as `jxl-encoder 0.3.1`, published and unbuildable, 44 errors, invisible in-workspace. It
-also costs 37 manifest restructurings after which no repo builds standalone, and it cannot
-absorb the 7 upstream forks or the 101 sub-workspaces. The targeted fixes reach all of those.
+**Why I still recommend against it.** **[CORRECTED — three of the four reasons do not
+survive.]** The published-breakage risk is real and stands: a path-resolved local build never
+sees it — verified today as `jxl-encoder 0.3.1`, published and unbuildable, 44 errors.
+But it is **not a reason to decline the parent workspace**, because the risk is identical
+under the `.cargo/config.toml` patch table this document recommends instead (both make every
+local build path-resolved), and it is answered by the advisory gate in step 3 either way.
+The other three reasons are wrong or irrelevant: "37 manifest restructurings after which no
+repo builds standalone" is refuted (**U1/T4-corrected**; the real cost is 181 *member*
+manifests, reversibly rewritten, still building standalone); "cannot absorb the 7 upstream
+forks" applies to merging repositories, which was never asked — a parent workspace claims
+crates and leaves every repo alone; and "cannot absorb the 101 sub-workspaces" is true but
+the shared config table reaches them (**T6**, re-verified), and layers 1 and 2 compose.
 
 **The tiebreaker is the false-positive bug.** The reason to believe "wire up the gate" is not
 just optimism this time: the gate has never had a fair run. It is 90% noise in its loudest
@@ -449,13 +672,24 @@ indefinitely, so this never has to be a big-bang.
 *Abandon:* `rm` one file. *Fixes:* #1 including the 18 sub-workspaces, and centralises #4/#6.
 *Verify against the prototype:* `~/tmp/zenproto/build_umbrella.py` already does this end-to-end.
 
-**Step 3 — a registry-truth gate (~half a day).** One CI job per publishable crate that
-builds with the dev patches **off**. `superwork ci-prep` / `unpatch` already perform exactly
-this transformation, and `Superwork.toml` already declares
+**Step 3 — a registry-truth gate (~half a day). [CORRECTED — and now written]** One CI job
+per publishable crate that builds with the dev patches **off**. `superwork ci-prep` /
+`unpatch` transform manifests, and `Superwork.toml` declares
 `[ci] default_strategy = "strip_path"` plus `[ci.overrides]` that delete `patch.crates-io`.
-Run it on the publish wave.
-*Abandon:* delete one job. *Fixes:* **#5 — the only problem that reaches users**, and the one
-a monorepo would make worse.
+
+**But manifest transformation is not sufficient, and neither is `cargo publish --dry-run`.**
+Neither removes an **ancestor `.cargo/config.toml`**, and `cargo package`'s verify build
+runs *inside* the tree, so the patch table applies and the gate passes on a crate that
+cannot build from crates.io (**U9**, measured). The gate must build the packaged `.crate`
+from a directory **outside** the tree. Written up and committed as
+[`ci-registry-truth.yml`](ci-registry-truth.yml) — advisory (`continue-on-error`), nightly +
+`workflow_dispatch` + manifest-touching PRs, with a second job that checks the versions
+**already on crates.io** still build (which no in-repo signal can ever catch, since the
+break can arrive from a dependency's release with no commit here — exactly `jxl-encoder
+0.3.1`). `cargo-copter` is complementary, not a substitute: it answers "did my change break
+my *dependents*", needs the crate already published with reverse-deps, and never builds the
+crate as a registry consumer would.
+*Abandon:* delete one workflow. *Fixes:* **#5 — the only problem that reaches users.**
 
 **Step 4 — make the CI gap unrepresentable (~half a day).** `zenjpeg` already has the right
 pattern and it is the only one in the tree: a guard step that greps for surviving
@@ -467,7 +701,9 @@ out-of-checkout path deps and hard-fails with
 on the *manifest edit*, not six hours later.
 
 **Step 5 — cheap wins, minutes each.** Set a shared `CARGO_TARGET_DIR` (T11 — measured
-2.45× dedup). Document `cargo superwork setup` as the machine-2 procedure. Run
+2.45× dedup). **[CORRECTED] Before documenting `cargo superwork setup` as the machine-2
+procedure, promote `Superwork.toml`'s `[[repo]]` table to the full repo→URL list — it is 10
+of 64 today (§6).** Run
 `superwork worktrees` and prune the 22 stale trees, including the 11 hidden under
 `.claude/worktrees/` that the `--` convention misses.
 
@@ -496,9 +732,28 @@ Fixtures under `~/tmp` (scratch; recreate as needed). All are seconds to run.
 | T9 | `cargo --config <file>` works for `[patch]` | `~/tmp/altconfig.toml` |
 | T10 | `--workspace` unifies features, `-p` does not | `~/tmp/featws` |
 | T11 | Shared `CARGO_TARGET_DIR` reuses artifacts across workspaces | `~/tmp/sharedtarget` |
+| **U1** | Parent may claim leaves of repos that are still workspace roots | `~/tmp/uw-test`, `~/tmp/uwscale/fix2` |
+| **U2** | A path dep inside the parent dir is auto-added as a member | `~/tmp/uwscale/fix1` |
+| **U3** | `exclude` keeps a repo on its own root; explicit `members` beat `exclude` | `~/tmp/uwscale/fix1`, `fix3` |
+| **U4** | A hybrid `[package]`+`[workspace]` root cannot be a member | `~/tmp/uwscale/fix2`, `fix3` |
+| **U5** | A member cannot inherit from a root that is not its workspace root | `~/tmp/uwscale/work` (scale) |
+| **U6** | `lints.workspace = true` fails the same way; `unsafe_code` conflicts | `~/tmp/uwscale/work` |
+| **U7** | Symlinked repo alias ⇒ `package collision in the lockfile` | `~/tmp/uwscale/work` |
+| **U8** | One lock ≠ one version: 108 crates at ≥2 versions | `~/tmp/uwscale/m10.json` |
+| **U9** | `cargo package --verify` is not registry truth inside the tree | `~/tmp/uwscale/regtruth` |
+| **U10** | 18 root profile names, 4 conflicting; only the parent's apply | `zen unify doctor` |
 
-Real-tree prototype: `~/tmp/zenproto/` (16 `git archive` copies + `build_umbrella.py`),
-which demonstrates the strip-manifests-and-share-one-config end state.
+Real-tree prototypes: `~/tmp/zenproto/` (first pass, 16 `git archive` copies +
+`build_umbrella.py`) and **`~/tmp/uwscale/work/` (second pass, a layout-faithful
+`git archive` mirror of 30 real repos, two levels deep like `~/work`)**. The second-pass
+mirror is what `zen unify` was developed and validated against; reproduce with
+`~/tmp/uwscale/mktree.py`. Live-tree entry point:
+
+```bash
+zen unify plan          # what is claimable and what blocks it   (read-only)
+zen unify doctor        # defects a unified view would expose    (read-only, exit 1 on findings)
+zen unify on --materialize && zen unify off      # full cycle, byte-identical restore
+```
 
 The cleaned-up conflict detector is committed at `scripts/patch-conflict-audit.py` and runs
 against the live tree, read-only:

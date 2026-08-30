@@ -1,0 +1,220 @@
+# Registry truth — ADVISORY, NEVER BLOCKING.
+#
+# Drop into a repo as .github/workflows/registry-truth.yml. This is a finished
+# workflow, not a `{{}}`-escaped template like ci-template.yml.
+#
+# WHAT PROBLEM THIS SOLVES
+# -----------------------
+# Every local build in this tree resolves sibling crates through path deps or a
+# shared [patch.crates-io] table. Users get neither. Published `jxl-encoder 0.3.1`
+# did not build from crates.io (44 errors against `magetypes 0.9.28`) and no local
+# build could have noticed.
+#
+# WHY `cargo publish --dry-run` IS NOT ENOUGH
+# -------------------------------------------
+# `cargo package` / `cargo publish --dry-run` DO strip path deps to version
+# requirements in the packaged manifest — that part is real. But the verify build
+# unpacks into <repo>/target/package/<name>-<ver>/ and compiles THERE, which is
+# INSIDE the tree. Cargo discovers configuration by walking up, so an ancestor
+# .cargo/config.toml `[patch.crates-io]` still applies and the verify build happily
+# compiles the local sibling.
+#
+#   MEASURED 2026-08-30: `cargo package` on butteraugli-cli 0.9.4, which requires
+#   `butteraugli ^0.9.4` (crates.io max: 0.9.3), PASSED in-tree —
+#   "Compiling butteraugli v0.9.4 (…/zen/butteraugli/butteraugli)".
+#   The same .crate extracted OUTSIDE the tree failed correctly:
+#   "failed to select a version for the requirement `butteraugli = ^0.9.4`".
+#
+# So the one thing this workflow must add is: BUILD THE PACKAGED CRATE SOMEWHERE
+# NO ANCESTOR CARGO CONFIG CAN REACH. Everything else is bookkeeping.
+#
+# WHAT ELSE ALREADY COVERS WHAT
+# -----------------------------
+#   cargo package / publish --dry-run  packaged-manifest correctness (path deps
+#                                      stripped, required fields, file list) —
+#                                      but its verify build is in-tree, see above.
+#   cargo-copter                       YOUR change vs REAL DEPENDENTS on crates.io.
+#                                      Answers "did I break my downstreams", not
+#                                      "does my own crate build from the registry",
+#                                      and needs the crate already published with
+#                                      reverse-deps. Complementary, not a substitute.
+#   cargo semver-checks                API compatibility between two versions.
+#                                      Says nothing about whether either builds.
+#   superwork ci-prep / unpatch        strips dev patches from manifests. Does not
+#                                      remove an ANCESTOR .cargo/config.toml.
+#
+# This workflow adds the missing third thing: does the artifact we would upload
+# actually compile against the real registry graph, from outside the tree.
+
+name: registry-truth
+
+on:
+  schedule:
+    - cron: "17 6 * * *"        # nightly; skew per repo so they do not stampede
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: "space-separated crate names (default: every publishable crate)"
+        required: false
+        default: ""
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: registry-truth-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  packaged-crate-builds-from-registry:
+    name: packaged crate builds from the registry
+    runs-on: ubuntu-latest
+    # ADVISORY. Never make this a required check and never remove this line.
+    # It reports a truth the main CI deliberately cannot see; if it starts
+    # blocking merges, people will delete it instead of fixing the finding.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Enumerate publishable crates
+        id: list
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.inputs.packages }}" ]; then
+            echo "pkgs=${{ github.event.inputs.packages }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # publish = false and version 0.0.0 crates are not shipped; skip them
+          pkgs=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[]
+                     | select(.publish == null)
+                     | select(.version != "0.0.0")
+                     | .name' | tr '\n' ' ')
+          echo "pkgs=$pkgs" >> "$GITHUB_OUTPUT"
+          echo "will check: $pkgs"
+
+      - name: Package, then build OUTSIDE the tree
+        id: check
+        run: |
+          set -uo pipefail
+          # $RUNNER_TEMP is outside the checkout, so no ancestor .cargo/config.toml
+          # and no ancestor Cargo.toml can be discovered by walking up. That is the
+          # entire point of this step — do not move it back under the workspace.
+          OUT="$RUNNER_TEMP/registry-truth"
+          mkdir -p "$OUT"
+          : > "$OUT/report.md"
+          fail=0
+          for p in ${{ steps.list.outputs.pkgs }}; do
+            echo "::group::$p"
+            # --no-verify: the in-tree verify build is exactly the false green we
+            # are trying to avoid. We do our own, out of tree, below.
+            if ! cargo package -p "$p" --no-verify --allow-dirty >"$OUT/$p.pack.log" 2>&1; then
+              echo "| \`$p\` | :x: | \`cargo package\` failed |" >> "$OUT/report.md"
+              tail -20 "$OUT/$p.pack.log"; fail=1; echo "::endgroup::"; continue
+            fi
+            crate=$(ls target/package/"$p"-*.crate 2>/dev/null | head -1)
+            if [ -z "$crate" ]; then
+              echo "| \`$p\` | :x: | no .crate produced |" >> "$OUT/report.md"
+              fail=1; echo "::endgroup::"; continue
+            fi
+            work="$OUT/$p"; rm -rf "$work"; mkdir -p "$work"
+            tar -xf "$crate" -C "$work"
+            dir=$(find "$work" -maxdepth 1 -mindepth 1 -type d | head -1)
+
+            # Guard: nothing may resolve to a local path in the shipped manifest.
+            if grep -nE '^\s*(path\s*=|\[patch)' "$dir/Cargo.toml"; then
+              echo "| \`$p\` | :x: | packaged manifest still carries a path dep or [patch] |" \
+                >> "$OUT/report.md"
+              fail=1; echo "::endgroup::"; continue
+            fi
+
+            if cargo build --manifest-path "$dir/Cargo.toml" --all-features \
+                 >"$OUT/$p.build.log" 2>&1; then
+              echo "| \`$p\` | :white_check_mark: | builds from the registry |" >> "$OUT/report.md"
+            else
+              echo "| \`$p\` | :x: | see log |" >> "$OUT/report.md"
+              echo '<details><summary>first errors</summary>' >> "$OUT/report.md"
+              echo '' >> "$OUT/report.md"; echo '```' >> "$OUT/report.md"
+              grep -m 20 -E '^(error|warning: unused)' "$OUT/$p.build.log" >> "$OUT/report.md" || true
+              echo '```' >> "$OUT/report.md"; echo '</details>' >> "$OUT/report.md"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          {
+            echo "## registry truth"
+            echo
+            echo "Each crate was packaged, then built from \`\$RUNNER_TEMP\` where no"
+            echo "ancestor \`.cargo/config.toml\` patch table can reach it."
+            echo
+            echo "| crate | | |"
+            echo "|---|---|---|"
+            cat "$OUT/report.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "failed=$fail" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: registry-truth-logs
+          path: ${{ runner.temp }}/registry-truth/*.log
+          if-no-files-found: ignore
+
+      - name: Report
+        run: |
+          if [ "${{ steps.check.outputs.failed }}" = "1" ]; then
+            echo "::warning title=registry truth::at least one crate does not build from crates.io — see the job summary"
+          fi
+
+  already-published-still-builds:
+    # The complement: the versions ALREADY on crates.io. Local CI can never catch a
+    # regression here, because the break can arrive from a dependency's release with
+    # no commit in this repo at all — which is how jxl-encoder 0.3.1 broke.
+    name: latest published version still builds
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build each published crate in a scratch project outside the tree
+        run: |
+          set -uo pipefail
+          scratch="$RUNNER_TEMP/published"; rm -rf "$scratch"
+          cargo new --lib "$scratch" >/dev/null
+          fail=0
+          {
+            echo "## already-published versions"
+            echo
+            echo "| crate | version | |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for p in $(cargo metadata --no-deps --format-version 1 \
+                     | jq -r '.packages[] | select(.publish == null) | .name'); do
+            v=$(cargo search "$p" --limit 1 2>/dev/null \
+                | sed -n "s/^$p = \"\([^\"]*\)\".*/\1/p")
+            [ -z "$v" ] && continue
+            ( cd "$scratch" \
+              && cargo remove "$p" >/dev/null 2>&1
+              cargo add "$p"@="$v" >/dev/null 2>&1 \
+              && cargo check >/dev/null 2>&1 )
+            if [ $? -eq 0 ]; then
+              echo "| \`$p\` | $v | :white_check_mark: |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "| \`$p\` | $v | :x: does not build from crates.io |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning title=$p $v::published version does not build from crates.io"
+              fail=1
+            fi
+          done
+          exit 0

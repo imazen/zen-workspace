@@ -1,0 +1,1835 @@
+#!/usr/bin/env python3
+# ruff: noqa
+"""zen — cross-workspace signal-to-noise tools for the zen crate tree.
+
+One file, stdlib only, no build step. Runs on macOS (bash 3.2, BSD stat),
+Linux and remote boxes alike. Invoke either way:
+
+    zen ci zenjpeg            # subcommand form
+    zenci zenjpeg             # argv[0] form (bin/zenci is a symlink to bin/zen)
+
+Every command exists because a specific class of confusion cost real hours.
+The traps each one encodes are documented in bin/README.md and in the
+`TRAP:` comments below — the tools are meant to be read as much as run.
+"""
+
+from __future__ import annotations
+
+import concurrent.futures as futures
+import fnmatch
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+# ─────────────────────────────────────────────────────────────────────────
+# Small helpers
+# ─────────────────────────────────────────────────────────────────────────
+
+HOME = os.path.expanduser("~")
+CACHE_DIR = os.environ.get("ZEN_CACHE_DIR", os.path.join(HOME, ".cache", "zen-tools"))
+SELF_DIR = os.path.dirname(os.path.abspath(__file__))
+WORKSPACE = os.path.dirname(SELF_DIR)  # …/zen-workspace
+
+STALE_SECONDS = int(os.environ.get("ZEN_MARKER_STALE", "300"))  # 5 min, per CLAUDE.md
+
+_TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def c(text, code):
+    return "\033[%sm%s\033[0m" % (code, text) if _TTY else text
+
+
+def red(s):
+    return c(s, "1;31")
+
+
+def green(s):
+    return c(s, "32")
+
+
+def yellow(s):
+    return c(s, "33")
+
+
+def blue(s):
+    return c(s, "36")
+
+
+def dim(s):
+    return c(s, "2")
+
+
+def bold(s):
+    return c(s, "1")
+
+
+def term_width(default=120):
+    return shutil.get_terminal_size((default, 24)).columns
+
+
+def die(msg, code=2):
+    sys.stderr.write(red("error: ") + msg + "\n")
+    sys.exit(code)
+
+
+def warn(msg):
+    sys.stderr.write(yellow("warn: ") + msg + "\n")
+
+
+def run(cmd, cwd=None, check=False, timeout=120, env=None):
+    """Run a command, return (rc, stdout, stderr). Never raises on nonzero."""
+    try:
+        p = subprocess.run(
+            cmd,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+            errors="replace",
+        )
+    except FileNotFoundError:
+        return 127, "", "%s: not found" % cmd[0]
+    except subprocess.TimeoutExpired:
+        return 124, "", "timed out after %ss: %s" % (timeout, " ".join(cmd))
+    if check and p.returncode != 0:
+        die("%s failed (%d): %s" % (" ".join(cmd[:3]), p.returncode, p.stderr.strip()))
+    return p.returncode, p.stdout, p.stderr
+
+
+def out(cmd, cwd=None, timeout=120):
+    """stdout of a command, stripped; '' on failure."""
+    return run(cmd, cwd=cwd, timeout=timeout)[1].strip()
+
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def iso_now():
+    return now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso(s):
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s.replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+
+def ago(dt):
+    """Human 'time since' for a datetime or epoch float."""
+    if dt is None:
+        return "?"
+    if isinstance(dt, (int, float)):
+        secs = time.time() - dt
+    else:
+        secs = (now_utc() - dt).total_seconds()
+    secs = int(secs)
+    if secs < 0:
+        secs = 0
+    if secs < 60:
+        return "%ds" % secs
+    if secs < 3600:
+        return "%dm" % (secs // 60)
+    if secs < 86400:
+        return "%dh%dm" % (secs // 3600, (secs % 3600) // 60)
+    return "%dd" % (secs // 86400)
+
+
+def parse_size(s):
+    """'40G' -> bytes."""
+    m = re.match(r"^\s*([0-9.]+)\s*([kKmMgGtT])?[bB]?\s*$", str(s))
+    if not m:
+        die("cannot parse size %r (try 40G, 500M)" % s)
+    n = float(m.group(1))
+    mult = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}
+    return int(n * mult[(m.group(2) or "").lower()])
+
+
+def human_size(n):
+    for unit in ("B", "K", "M", "G", "T"):
+        if abs(n) < 1024 or unit == "T":
+            return ("%.1f%s" % (n, unit)) if unit not in ("B", "K") else "%d%s" % (n, unit)
+        n /= 1024.0
+    return str(n)
+
+
+def pmap(fn, items, workers=12):
+    """Parallel map preserving input order. The whole point is speed."""
+    items = list(items)
+    if not items:
+        return []
+    n = min(workers, len(items))
+    if n <= 1:
+        return [fn(i) for i in items]
+    with futures.ThreadPoolExecutor(max_workers=n) as ex:
+        return list(ex.map(fn, items))
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Superwork.toml — reuse the existing source of truth for roots + orgs
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _read_superwork():
+    """Minimal, forgiving parse of zen-workspace/Superwork.toml.
+
+    Deliberately regex-based: tomllib is 3.11+, and this only needs three
+    keys. Superwork.toml already encodes scan_dirs / extra_roots / owned_orgs
+    and per-repo github overrides — do not invent a second source of truth.
+    """
+    path = os.environ.get("ZEN_SUPERWORK", os.path.join(WORKSPACE, "Superwork.toml"))
+    cfg = {"scan_dirs": [], "extra_roots": [], "owned_orgs": [], "repo_github": {}}
+    try:
+        with open(path, "r") as f:
+            text = f.read()
+    except OSError:
+        return cfg
+    base = os.path.dirname(os.path.abspath(path))
+
+    def arr(key):
+        m = re.search(r"^\s*%s\s*=\s*\[(.*?)\]" % key, text, re.M | re.S)
+        return re.findall(r'"([^"]+)"', m.group(1)) if m else []
+
+    cfg["scan_dirs"] = [os.path.normpath(os.path.join(base, d)) for d in arr("scan_dirs")]
+    cfg["extra_roots"] = [os.path.normpath(os.path.join(base, d)) for d in arr("extra_roots")]
+    cfg["owned_orgs"] = [o.lower() for o in arr("owned_orgs")]
+    for blk in re.findall(r"\[\[repo\]\]\s*((?:\s*\w+\s*=\s*\"[^\"]*\"\s*\n?)+)", text):
+        d = dict(re.findall(r"(\w+)\s*=\s*\"([^\"]*)\"", blk))
+        if "dir" in d and "github" in d:
+            cfg["repo_github"][os.path.normpath(os.path.join(base, d["dir"]))] = d["github"]
+    return cfg
+
+
+SW = _read_superwork()
+OWNED_ORGS = set(SW["owned_orgs"] or ["imazen", "lilith"])
+
+
+def default_roots():
+    """Directories whose immediate children are scanned for repos."""
+    env = os.environ.get("ZEN_ROOTS")
+    if env:
+        return [os.path.abspath(os.path.expanduser(p)) for p in env.split(":") if p]
+    roots = []
+    parent = os.path.dirname(WORKSPACE)  # ~/work
+    for d in [parent] + SW["scan_dirs"]:
+        if os.path.isdir(d) and d not in roots:
+            roots.append(d)
+    if not roots:  # zen-workspace not found next to us; fall back to convention
+        for d in (os.path.join(HOME, "work"), os.path.join(HOME, "work", "zen")):
+            if os.path.isdir(d):
+                roots.append(d)
+    return roots
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Repo discovery
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class Repo(object):
+    __slots__ = ("path", "name", "kind", "aliases", "_trunk", "_slug")
+
+    def __init__(self, path, name, kind):
+        self.path = path
+        self.name = name
+        self.kind = kind  # git | worktree | jj
+        self.aliases = set()
+        self._trunk = None
+        self._slug = None
+
+    def __repr__(self):
+        return "<Repo %s %s>" % (self.name, self.kind)
+
+    # ── identity ────────────────────────────────────────────────────────
+    @property
+    def slug(self):
+        """owner/repo on GitHub, or None."""
+        if self._slug is None:
+            self._slug = self._detect_slug() or ""
+        return self._slug or None
+
+    def _detect_slug(self):
+        override = SW["repo_github"].get(os.path.normpath(self.path))
+        if override:
+            return override
+        url = out(["git", "remote", "get-url", "origin"], cwd=self.path, timeout=15)
+        if not url and self.kind == "jj":
+            # jj-only workspace: ask jj for the remote
+            for line in out(["jj", "git", "remote", "list"], cwd=self.path, timeout=15).splitlines():
+                if line.startswith("origin "):
+                    url = line.split(None, 1)[1].strip()
+                    break
+        return slug_from_url(url)
+
+    @property
+    def owned(self):
+        s = self.slug
+        return bool(s) and s.split("/")[0].lower() in OWNED_ORGS
+
+    # ── trunk ───────────────────────────────────────────────────────────
+    @property
+    def trunk(self):
+        """The default branch name. NEVER assumed.
+
+        TRAP: most repos use `main`; zenmetrics uses `master` and a
+        server-side ruleset blocks creating `main`. Guessing wrong makes
+        every downstream answer wrong, silently.
+        """
+        if self._trunk is None:
+            self._trunk = detect_trunk(self)
+        return self._trunk
+
+
+def slug_from_url(url):
+    if not url:
+        return None
+    m = re.search(r"github\.com[:/]+([^/]+)/([^/\s]+?)(?:\.git)?/?$", url.strip())
+    return "%s/%s" % (m.group(1), m.group(2)) if m else None
+
+
+def _cache_path(name):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    return os.path.join(CACHE_DIR, name)
+
+
+def _cache_get(name, ttl):
+    try:
+        p = _cache_path(name)
+        if time.time() - os.path.getmtime(p) > ttl:
+            return None
+        with open(p) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _cache_put(name, obj):
+    try:
+        with open(_cache_path(name), "w") as f:
+            json.dump(obj, f)
+    except OSError:
+        pass
+
+
+TRUNK_CACHE_TTL = 7 * 86400
+
+
+def detect_trunk(repo):
+    cache = _cache_get("trunks.json", TRUNK_CACHE_TTL) or {}
+    key = os.path.normpath(repo.path)
+    if key in cache:
+        return cache[key]
+    trunk = None
+    # 1. Local origin/HEAD symref — set by clone, cheap and usually right.
+    ref = out(["git", "symbolic-ref", "-q", "refs/remotes/origin/HEAD"], cwd=repo.path, timeout=15)
+    if ref.startswith("refs/remotes/origin/"):
+        trunk = ref[len("refs/remotes/origin/") :]
+    # 2. Which of main/master actually exists as a remote-tracking ref.
+    if not trunk:
+        refs = out(["git", "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin"],
+                   cwd=repo.path, timeout=15).split()
+        have = set(r.split("/", 1)[1] for r in refs if "/" in r)
+        for cand in ("main", "master", "trunk", "develop"):
+            if cand in have:
+                trunk = cand
+                break
+    # 3. Ask GitHub (authoritative, costs a call).
+    if not trunk and repo.slug:
+        trunk = out(["gh", "repo", "view", repo.slug, "--json", "defaultBranchRef",
+                     "--jq", ".defaultBranchRef.name"], timeout=30) or None
+    # 4. jj bookmark fallback for jj-only workspaces.
+    if not trunk and repo.kind == "jj":
+        bm = out(["jj", "bookmark", "list", "--all-remotes", "-T", "name"], cwd=repo.path, timeout=20)
+        for cand in ("main", "master"):
+            if cand in bm:
+                trunk = cand
+                break
+    if trunk:
+        cache[key] = trunk
+        _cache_put("trunks.json", cache)
+    return trunk
+
+
+def discover(roots=None, include_worktrees=False):
+    """Find repos under roots. Generic: anything with .git or .jj."""
+    roots = roots or default_roots()
+    found = {}  # realpath -> Repo
+    candidates = []
+    for root in roots:
+        root = os.path.abspath(os.path.expanduser(root))
+        if not os.path.isdir(root):
+            continue
+        if os.path.exists(os.path.join(root, ".git")) or os.path.exists(os.path.join(root, ".jj")):
+            candidates.append(root)
+        try:
+            for entry in sorted(os.listdir(root)):
+                if entry.startswith("."):
+                    continue
+                candidates.append(os.path.join(root, entry))
+        except OSError:
+            continue
+    for path in candidates:
+        if not os.path.isdir(path):
+            continue
+        has_git = os.path.exists(os.path.join(path, ".git"))
+        has_jj = os.path.exists(os.path.join(path, ".jj"))
+        if not (has_git or has_jj):
+            continue
+        # TRAP: a linked git worktree has .git as a FILE, not a directory;
+        # a jj workspace has .jj and no .git at all. Both are the SAME
+        # upstream repo as their parent — counting them as separate repos
+        # double-reports CI and confuses "is it pushed?".
+        if has_git and os.path.isfile(os.path.join(path, ".git")):
+            kind = "worktree"
+        elif has_git:
+            kind = "git"
+        else:
+            kind = "jj"
+        real = os.path.realpath(path)
+        name = os.path.basename(path)
+        if real in found:
+            # TRAP: several dirs are symlinks (work/butteraugli -> work/zen/butteraugli,
+            # work/zen/imageflow -> work/imageflow). Dedupe on realpath and keep the
+            # real directory, not the link. This is normal here, not an anomaly.
+            existing = found[real]
+            existing.aliases.add(path)
+            if os.path.islink(path) is False and os.path.islink(existing.path):
+                existing.path = path
+                existing.name = name
+            continue
+        if kind == "worktree" and not include_worktrees:
+            # Still record it so `zen space` can see its target dir.
+            r = Repo(path, name, kind)
+            found[real] = r
+            continue
+        found[real] = Repo(path, name, kind)
+    repos = sorted(found.values(), key=lambda r: r.name.lower())
+    if not include_worktrees:
+        repos = [r for r in repos if r.kind != "worktree"]
+    return repos
+
+
+def select_repos(names, roots=None, all_repos=False, include_worktrees=False):
+    """Resolve CLI repo arguments. No args = every owned repo (or cwd's repo
+    if we're inside one and the command is repo-scoped — callers decide)."""
+    repos = discover(roots, include_worktrees=include_worktrees)
+    if names:
+        by_name = {}
+        for r in repos:
+            by_name.setdefault(r.name.lower(), r)
+        chosen = []
+        for n in names:
+            key = os.path.basename(os.path.normpath(n)).lower()
+            if key in by_name:
+                chosen.append(by_name[key])
+            elif os.path.isdir(n):
+                chosen.append(repo_at(n) or Repo(os.path.abspath(n), key, "git"))
+            else:
+                die("no repo named %r under %s" % (n, ", ".join(roots or default_roots())))
+        return chosen
+    if not all_repos:
+        repos = [r for r in repos if r.owned]
+    return repos
+
+
+def repo_at(path=None):
+    """The repo containing `path` (default cwd), or None."""
+    p = os.path.abspath(path or os.getcwd())
+    while True:
+        if os.path.exists(os.path.join(p, ".git")) or os.path.exists(os.path.join(p, ".jj")):
+            has_git = os.path.exists(os.path.join(p, ".git"))
+            kind = "git" if has_git and os.path.isdir(os.path.join(p, ".git")) else (
+                "worktree" if has_git else "jj")
+            return Repo(p, os.path.basename(p), kind)
+        parent = os.path.dirname(p)
+        if parent == p:
+            return None
+        p = parent
+
+
+def repo_arg(names, need_one=True):
+    """For repo-scoped commands: one named repo, or the cwd's repo."""
+    if names:
+        return select_repos(names[:1])[0]
+    r = repo_at()
+    if not r and need_one:
+        die("not inside a git/jj repo, and no repo named on the command line")
+    return r
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Git / jj ref handling  (the syntax trap)
+# ─────────────────────────────────────────────────────────────────────────
+
+JJ_REF_RE = re.compile(r"^(?P<name>[A-Za-z0-9._/-]+)@(?P<remote>[A-Za-z0-9._-]+)$")
+
+
+def resolve_commit(repo, rev, soft=False):
+    """Resolve a user-supplied revision to a full git sha, or die loudly.
+
+    `soft=True` returns None instead of dying — for callers (zenci --since)
+    where the sha may legitimately exist only on the remote.
+
+    TRAP (cost hours, produced a false 'these differ' verdict):
+      `master@origin` is jj syntax. `origin/master` is git syntax.
+      `git show master@origin` prints NOTHING to stdout and writes the error
+      to stderr — so `git show master@origin | sha256sum` happily hashes the
+      empty string and the caller believes two trees differ. Never let a bad
+      ref fail silently: validate with rev-parse and translate jj forms.
+    """
+    if not rev:
+        return None
+    is_jj = os.path.exists(os.path.join(repo.path, ".jj"))
+    # TRAP: `@` means *the working-copy change* to jj, but git treats `@` as a
+    # plain alias for HEAD — which in a colocated repo is `@-`, the PARENT.
+    # `git rev-parse @` therefore succeeds and silently answers the wrong
+    # question. Anything `@`-shaped must go through jj first, never git.
+    if is_jj and re.match(r"^@[-+]*$", rev):
+        cid = out(["jj", "log", "--no-graph", "-r", rev, "-T", "commit_id"],
+                  cwd=repo.path, timeout=30).strip().split("\n")[0].strip()
+        if re.match(r"^[0-9a-f]{40}$", cid):
+            return cid
+        if soft:
+            return None
+        die("jj could not resolve %r in %s" % (rev, repo.path))
+    m = JJ_REF_RE.match(rev)
+    if m:
+        git_form = "%s/%s" % (m.group("remote"), m.group("name"))
+        alt = out(["git", "rev-parse", "--verify", "--quiet", git_form + "^{commit}"], cwd=repo.path)
+        if alt:
+            warn("%r is jj syntax; git wants %r (translated for you)" % (rev, git_form))
+            return alt
+        msg = ("%r looks like jj ref syntax (name@remote). git needs %r, which does not exist here.\n"
+               "       jj: `jj log -r %s`   git: `git show %s`" % (rev, git_form, rev, git_form))
+        if soft:
+            warn(msg)
+            return None
+        die(msg)
+    sha = out(["git", "rev-parse", "--verify", "--quiet", rev + "^{commit}"], cwd=repo.path)
+    if sha:
+        return sha
+    # Maybe it's a jj change-id (or `@`, `@-`) — resolve through jj.
+    if os.path.exists(os.path.join(repo.path, ".jj")):
+        cid = out(["jj", "log", "--no-graph", "-r", rev, "-T", "commit_id"], cwd=repo.path, timeout=30)
+        cid = cid.strip().split("\n")[0].strip()
+        if re.match(r"^[0-9a-f]{40}$", cid):
+            if rev in ("@", "@-"):
+                pass  # normal and expected inside a jj repo
+            else:
+                warn("%r resolved through jj to %s" % (rev, cid[:12]))
+            return cid
+    if soft:
+        return None
+    die("cannot resolve %r in %s.\n"
+        "       If it came from `jj log`, it may be a change-id whose commit is not in git yet.\n"
+        "       If it looks like `main@origin`, that is jj syntax — git wants `origin/main`."
+        % (rev, repo.path))
+
+
+def trunk_ref(repo, remote=True):
+    """`refs/remotes/origin/<trunk>` — verified to exist."""
+    t = repo.trunk
+    if not t:
+        return None
+    ref = "refs/remotes/origin/%s" % t if remote else t
+    if out(["git", "rev-parse", "--verify", "--quiet", ref], cwd=repo.path):
+        return ref
+    return None
+
+
+def jj_head_commit(repo):
+    """Inside a jj colocated repo, `git log -1` shows @- (the parent), because
+    the working-copy change is not what HEAD points at. Report both so nobody
+    concludes their commit vanished."""
+    if not os.path.exists(os.path.join(repo.path, ".jj")):
+        return None
+    txt = out(["jj", "log", "--no-graph", "-r", "@", "-T",
+               'commit_id ++ "\\t" ++ description.first_line() ++ "\\t" ++ if(empty, "empty", "nonempty")'],
+              cwd=repo.path, timeout=30)
+    parts = txt.split("\t")
+    if len(parts) >= 3:
+        return {"commit": parts[0], "desc": parts[1], "empty": parts[2] == "empty"}
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# GitHub Actions
+# ─────────────────────────────────────────────────────────────────────────
+
+RUNS_TTL = int(os.environ.get("ZEN_RUNS_TTL", "45"))  # seconds
+
+
+def gh_json(endpoint, ttl=0, timeout=60):
+    key = re.sub(r"[^A-Za-z0-9]+", "_", endpoint)[:180] + ".json"
+    if ttl:
+        hit = _cache_get(key, ttl)
+        if hit is not None:
+            return hit
+    rc, so, se = run(["gh", "api", "-H", "Accept: application/vnd.github+json", endpoint],
+                     timeout=timeout)
+    if rc != 0:
+        return {"_error": (se or so).strip().split("\n")[0][:200]}
+    try:
+        obj = json.loads(so)
+    except ValueError:
+        return {"_error": "unparseable response"}
+    if ttl:
+        _cache_put(key, obj)
+    return obj
+
+
+# Verdict vocabulary. CANCELLED is deliberately NOT a failure and NOT a pass:
+# it is the ABSENCE of a verdict. Treating it as either is the single most
+# expensive CI misreading in this workspace.
+PASS, FAIL, CANCELLED, RUNNING, NEUTRAL, NONE = "pass", "fail", "cancelled", "running", "skipped", "none"
+
+FAIL_CONCLUSIONS = {"failure", "timed_out", "startup_failure", "action_required"}
+
+VERDICT_STYLE = {
+    PASS: (green, "PASS"),
+    FAIL: (red, "FAIL"),
+    CANCELLED: (yellow, "CANCEL"),
+    RUNNING: (blue, "RUN"),
+    NEUTRAL: (dim, "SKIP"),
+    NONE: (dim, "NONE"),
+}
+
+
+def verdict_of(run_obj):
+    if not run_obj:
+        return NONE
+    if run_obj.get("status") != "completed":
+        return RUNNING
+    concl = run_obj.get("conclusion")
+    if concl == "success":
+        return PASS
+    if concl == "cancelled":
+        return CANCELLED
+    if concl in FAIL_CONCLUSIONS:
+        return FAIL
+    return NEUTRAL
+
+
+def fetch_runs(repo, per_page=40, fresh=False, branch=None):
+    """Recent workflow runs on the trunk (or a given branch)."""
+    if not repo.slug:
+        return {"_error": "no github remote"}
+    br = branch or repo.trunk
+    if not br:
+        return {"_error": "no trunk detected"}
+    ep = "repos/%s/actions/runs?per_page=%d&branch=%s" % (repo.slug, per_page, br)
+    data = gh_json(ep, ttl=0 if fresh else RUNS_TTL)
+    return data
+
+
+def fetch_jobs(repo, run_id, fresh=False):
+    ep = "repos/%s/actions/runs/%s/jobs?per_page=100" % (repo.slug, run_id)
+    return gh_json(ep, ttl=0 if fresh else RUNS_TTL)
+
+
+def group_by_workflow(runs, include_bots=False):
+    """Group runs by workflow_id -> {label, path, runs newest-first}.
+
+    TRAP: grouping by run NAME shatters Dependabot into one pseudo-workflow
+    per update ('cargo in /. for rand - Update #1344031022'), each with a
+    single run and therefore no history — which then reads as a dozen
+    permanently-red workflows. workflow_id is the stable key; runs generated
+    by GitHub itself live under a `dynamic/` path and are hidden by default
+    because a failing Dependabot updater does not mean the code is broken.
+    """
+    groups = {}
+    for r in runs:
+        path = r.get("path") or ""
+        if path.startswith("dynamic/") and not include_bots:
+            continue
+        key = r.get("workflow_id") or r.get("name") or path
+        g = groups.setdefault(key, {"path": path, "names": set(), "runs": []})
+        g["names"].add(r.get("name") or "?")
+        g["runs"].append(r)
+    for g in groups.values():
+        g["runs"].sort(key=lambda r: (r.get("created_at") or "", r.get("id") or 0), reverse=True)
+        # A workflow whose runs have varying names (Dependabot, dispatches) is
+        # labelled by its file path instead, so the label is stable.
+        g["label"] = (list(g["names"])[0] if len(g["names"]) == 1
+                      else os.path.basename(g["path"]) or "?")
+    return groups
+
+
+def first_real_failure(jobs):
+    """The job that actually failed, not the ones cancelled in its wake.
+
+    TRAP: a red Lint job fail-fasts the matrix, cancelling 8 sibling jobs.
+    `gh run view` then shows a wall of cancellations and the eye lands on
+    them. The real failure is the failed job that finished EARLIEST.
+    """
+    failed = [j for j in jobs if j.get("conclusion") in FAIL_CONCLUSIONS]
+    if not failed:
+        return None
+    failed.sort(key=lambda j: (j.get("completed_at") or "9999", j.get("id") or 0))
+    j = failed[0]
+    step = ""
+    for s in j.get("steps") or []:
+        if s.get("conclusion") in FAIL_CONCLUSIONS:
+            step = s.get("name") or ""
+            break
+    return {"name": j.get("name"), "step": step, "id": j.get("id"),
+            "url": j.get("html_url"), "n_failed": len(failed)}
+
+
+def job_tally(jobs):
+    t = {"ok": 0, "fail": 0, "cancel": 0, "run": 0, "skip": 0}
+    for j in jobs:
+        if j.get("status") != "completed":
+            t["run"] += 1
+        elif j.get("conclusion") == "success":
+            t["ok"] += 1
+        elif j.get("conclusion") in FAIL_CONCLUSIONS:
+            t["fail"] += 1
+        elif j.get("conclusion") == "cancelled":
+            t["cancel"] += 1
+        else:
+            t["skip"] += 1
+    return t
+
+
+def tally_str(t):
+    bits = []
+    if t["fail"]:
+        bits.append(red("%d✗" % t["fail"]))
+    if t["ok"]:
+        bits.append(green("%d✓" % t["ok"]))
+    if t["cancel"]:
+        bits.append(yellow("%d⊘" % t["cancel"]))
+    if t["run"]:
+        bits.append(blue("%d…" % t["run"]))
+    if t["skip"]:
+        bits.append(dim("%d-" % t["skip"]))
+    return " ".join(bits) if bits else dim("no jobs")
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z\s?")
+# Deliberately no `warning:` — warnings outnumber errors in a broken build and
+# burying the one real error under four warnings is the noise we are removing.
+ERROR_LINE_RE = re.compile(
+    r"^(?:##\[error\]|error(?:\[E\d+\])?:|thread '.*' panicked|"
+    r"failures:|FAILED|Error:|fatal:|assertion .*failed|Diff in )", re.I)
+NOISE_ERROR_RE = re.compile(
+    r"^(?:##\[error\]Process completed with exit code|"
+    r"error: could not compile .* due to \d+ previous error|"
+    r"##\[error\]The (?:operation|process) was canceled)", re.I)
+
+
+def first_error_line(repo, job_id, max_lines=6):
+    """First genuinely informative error line from a job log.
+
+    TRAP: GitHub log lines are `<ISO timestamp>Z ` prefixed AND carry raw
+    ANSI colour escapes, so a naive `grep '^error'` matches nothing and you
+    conclude the log has no errors. Strip both before matching. Then skip
+    the trailing summary noise ('could not compile … due to N previous
+    errors', 'Process completed with exit code 101') which says nothing.
+    """
+    rc, so, se = run(["gh", "api", "repos/%s/actions/jobs/%s/logs" % (repo.slug, job_id)],
+                     timeout=90)
+    if rc != 0:
+        return []
+    hits = []
+    for raw in so.splitlines():
+        line = ANSI_RE.sub("", TS_RE.sub("", raw)).rstrip()
+        if not line:
+            continue
+        if ERROR_LINE_RE.match(line) and not NOISE_ERROR_RE.match(line):
+            if line not in hits:
+                hits.append(line)
+            if len(hits) >= max_lines:
+                break
+    if not hits:  # fall back to the noise if that is all there is
+        for raw in so.splitlines():
+            line = ANSI_RE.sub("", TS_RE.sub("", raw)).rstrip()
+            if line.startswith("##[error]"):
+                hits.append(line)
+                break
+    return hits
+
+
+def newest_verdict_run(run_list):
+    """Newest run that actually carries a verdict (pass/fail), skipping
+    cancelled and in-flight runs — because those are not answers."""
+    for r in run_list:
+        v = verdict_of(r)
+        if v in (PASS, FAIL, NEUTRAL):
+            return r, v
+    return None, NONE
+
+
+def introducing_run(run_list, failing_run):
+    """Walk back over same-workflow runs to the OLDEST consecutive failure.
+
+    Cancelled runs are skipped, not treated as a break in the streak — a
+    cancellation carries no verdict, so it cannot exonerate a commit.
+    Returns (first_bad_run, last_good_run).
+    """
+    seen_failing = None
+    idx = run_list.index(failing_run) if failing_run in run_list else 0
+    for r in run_list[idx:]:
+        v = verdict_of(r)
+        if v == FAIL:
+            seen_failing = r
+        elif v in (CANCELLED, RUNNING):
+            continue
+        else:
+            return seen_failing, r
+    return seen_failing, None
+
+
+def short(s, n):
+    s = s or ""
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# cmd: ci
+# ─────────────────────────────────────────────────────────────────────────
+
+CI_HELP = """\
+zenci [repo…] [options]     one line per workflow: verdict, head sha, job tally, FIRST real failure
+
+  --since <rev>   did THIS commit get a verdict, or did a newer push cancel its run?
+                  accepts a git sha, a branch, or a jj change-id / @ / @-
+  --all           include non-imazen/lilith repos (forks, upstreams)
+  --fail-only     only workflows that are not passing
+  --fresh         bypass the %ds run cache
+  --branch <b>    inspect a branch other than the trunk
+  --limit N       runs fetched per repo (default 40)
+""" % RUNS_TTL
+
+
+def cmd_ci(argv):
+    opts, names = parse_flags(argv, {"--since": 1, "--branch": 1, "--limit": 1},
+                              {"--all", "--fail-only", "--fresh", "--include-bots", "-h", "--help"})
+    if "-h" in opts or "--help" in opts:
+        print(CI_HELP)
+        return 0
+    repos = select_repos(names, all_repos="--all" in opts)
+    if not repos:
+        die("no repos found")
+    fresh = "--fresh" in opts
+    limit = int(opts.get("--limit", 40))
+    since_raw = opts.get("--since")
+
+    def work(repo):
+        since_sha = None
+        if since_raw:
+            # Soft resolution: the sha may exist only on the remote (local clone
+            # behind), or be a jj change-id, or already be a literal prefix.
+            since_sha = resolve_commit(repo, since_raw, soft=True) if len(repos) == 1 else None
+            if since_sha is None:
+                since_sha = since_raw
+        data = fetch_runs(repo, per_page=limit, fresh=fresh, branch=opts.get("--branch"))
+        if "_error" in data:
+            return (repo, None, data["_error"], since_sha)
+        groups = group_by_workflow(data.get("workflow_runs") or [], "--include-bots" in opts)
+        return (repo, groups, None, since_sha)
+
+    results = pmap(work, repos)
+    width = term_width()
+    namew = max([len(r.name) for r in repos] + [8])
+    rc = 0
+    for repo, groups, err, since_sha in results:
+        if err:
+            if err != "no github remote":
+                print("%-*s  %s" % (namew, repo.name, dim(err)))
+            continue
+        if not groups:
+            if "--fail-only" not in opts:
+                print("%-*s  %s" % (namew, repo.name, dim("no runs on %s" % repo.trunk)))
+            continue
+        for _key, grp in sorted(groups.items(), key=lambda kv: kv[1]["label"].lower()):
+            wf, runs = grp["label"], grp["runs"]
+            if since_sha:
+                match = [r for r in runs if (r.get("head_sha") or "").startswith(since_sha[:40])]
+                if not match:
+                    print("%-*s  %-22s %s" % (namew, repo.name, short(wf, 22),
+                          yellow("NO RUN") + dim(" for %s — path-filtered, or superseded before dispatch"
+                                                 % since_sha[:8])))
+                    rc = max(rc, 1)
+                    continue
+                runs = match + [r for r in runs if r not in match]
+            top = runs[0]
+            v = verdict_of(top)
+            if "--fail-only" in opts and v == PASS:
+                continue
+            line = render_ci_line(repo, wf, runs, top, v, namew, width, fresh, since_sha)
+            print(line)
+            if v in (FAIL, CANCELLED, NONE):
+                rc = max(rc, 1)
+    return rc
+
+
+def render_ci_line(repo, wf, runs, top, v, namew, width, fresh, since_sha):
+    style, label = VERDICT_STYLE[v]
+    sha = (top.get("head_sha") or "")[:8]
+    detail = ""
+    if v in (FAIL, CANCELLED):
+        jobs = (fetch_jobs(repo, top["id"], fresh=fresh) or {}).get("jobs") or []
+        t = job_tally(jobs)
+        fr = first_real_failure(jobs)
+        what = (fr["name"] + (" › " + fr["step"] if fr["step"] else "")) if fr else ""
+        if fr and v == CANCELLED:
+            # A cancelled run that contains a genuine failure is a FAILURE
+            # wearing a cancellation costume. Lead with that — it is the whole
+            # point, and it must survive truncation on a narrow terminal.
+            detail = yellow("no verdict, BUT a job really failed: ") + red(what)
+            detail += dim("   (%d jobs: %s)" % (len(jobs), tally_str(t)))
+        elif fr:
+            detail = "%d jobs: %s  first fail: %s" % (len(jobs), tally_str(t), red(what))
+        elif v == FAIL:
+            detail = "%d jobs: %s  %s" % (len(jobs), tally_str(t),
+                                          yellow("run failed with no failed job (setup/quota/timeout?)"))
+        else:
+            prev, pv = newest_verdict_run(runs[1:])
+            if prev is not None:
+                ps, pl = VERDICT_STYLE[pv]
+                detail += "  no verdict; last real: %s @%s (%s ago)" % (
+                    ps(pl), (prev.get("head_sha") or "")[:8], ago(parse_iso(prev.get("created_at"))))
+            else:
+                detail += "  no verdict, and no earlier verdict either"
+    elif v == RUNNING:
+        detail = dim("%s, started %s ago" % (top.get("status"), ago(parse_iso(top.get("run_started_at")
+                                                                              or top.get("created_at")))))
+    else:
+        detail = dim("%s ago" % ago(parse_iso(top.get("created_at"))))
+    prefix = "%-*s  %-22s %-6s %s  " % (namew, repo.name, short(wf, 22), style(label), sha)
+    plain_len = len(re.sub(r"\033\[[0-9;]*m", "", prefix))
+    return prefix + short_ansi(detail, max(20, width - plain_len))
+
+
+def short_ansi(s, n):
+    """Truncate to n visible columns, keeping escapes intact enough."""
+    plain = re.sub(r"\033\[[0-9;]*m", "", s)
+    if len(plain) <= n:
+        return s
+    # Rebuild by walking, counting only visible chars.
+    res, count, i = [], 0, 0
+    while i < len(s) and count < n - 1:
+        if s[i] == "\033":
+            j = s.find("m", i)
+            if j == -1:
+                break
+            res.append(s[i : j + 1])
+            i = j + 1
+            continue
+        res.append(s[i])
+        count += 1
+        i += 1
+    return "".join(res) + "…" + ("\033[0m" if _TTY else "")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# cmd: red
+# ─────────────────────────────────────────────────────────────────────────
+
+RED_HELP = """\
+zenred [repo…] [options]    what is red RIGHT NOW, the first error line, and which commit broke it
+
+  --all         include non-imazen/lilith repos (forks, upstreams)
+  --no-log      skip fetching job logs (much faster, loses the error line)
+  --fresh       bypass the run cache
+  --limit N     runs fetched per repo (default 60; more history = better blame)
+"""
+
+
+def cmd_red(argv):
+    opts, names = parse_flags(argv, {"--limit": 1},
+                              {"--all", "--no-log", "--fresh", "--include-bots", "-h", "--help"})
+    if "-h" in opts or "--help" in opts:
+        print(RED_HELP)
+        return 0
+    repos = select_repos(names, all_repos="--all" in opts)
+    fresh = "--fresh" in opts
+    limit = int(opts.get("--limit", 60))
+
+    def scan(repo):
+        data = fetch_runs(repo, per_page=limit, fresh=fresh)
+        if "_error" in data:
+            return (repo, [])
+        groups = group_by_workflow(data.get("workflow_runs") or [], "--include-bots" in opts)
+        reds = []
+        for key, grp in groups.items():
+            vr, v = newest_verdict_run(grp["runs"])
+            if v != FAIL:
+                continue
+            reds.append({"wf": grp["label"], "run": vr, "wf_id": key,
+                         "stale": grp["runs"][0] is not vr, "runs": grp["runs"]})
+        return (repo, reds)
+
+    results = pmap(scan, repos, workers=12)
+    reds_all = [(r, reds) for r, reds in results if reds]
+
+    # Second pass, parallel: jobs + logs only for what is actually red.
+    def enrich(item):
+        repo, reds = item
+        for red_item in reds:
+            jobs = (fetch_jobs(repo, red_item["run"]["id"], fresh=fresh) or {}).get("jobs") or []
+            red_item["tally"] = job_tally(jobs)
+            red_item["first"] = first_real_failure(jobs)
+            red_item["errors"] = []
+            if "--no-log" not in opts and red_item["first"]:
+                red_item["errors"] = first_error_line(repo, red_item["first"]["id"])
+            # Blame needs THIS workflow's own history, not the repo-wide run
+            # feed: a workflow that runs rarely gets one or two entries in the
+            # shared window, and "no green in the last 1 run" is not blame.
+            hist = red_item["runs"]
+            if isinstance(red_item["wf_id"], int):
+                h = gh_json("repos/%s/actions/workflows/%s/runs?per_page=40&branch=%s"
+                            % (repo.slug, red_item["wf_id"], repo.trunk),
+                            ttl=0 if fresh else RUNS_TTL)
+                if "_error" not in h and h.get("workflow_runs"):
+                    hist = sorted(h["workflow_runs"],
+                                  key=lambda r: (r.get("created_at") or "", r.get("id") or 0),
+                                  reverse=True)
+            match = [r for r in hist if r.get("id") == red_item["run"].get("id")]
+            anchor = match[0] if match else (hist[0] if hist else red_item["run"])
+            red_item["first_bad"], red_item["last_good"] = introducing_run(hist, anchor)
+            red_item["window"] = len(hist)
+        return item
+
+    reds_all = pmap(enrich, reds_all, workers=8)
+
+    if not reds_all:
+        print(green("all clear") + dim(" — %d repos, no failing workflow on trunk" % len(repos)))
+        return 0
+    width = term_width()
+    for repo, reds in reds_all:
+        print(bold(red("● " + repo.name)) + dim("  (%s)  %s" % (repo.trunk, repo.slug or "?")))
+        for it in reds:
+            r = it["run"]
+            when = ago(parse_iso(r.get("created_at")))
+            head = "    %s  %s  %s ago" % (bold(it["wf"]), (r.get("head_sha") or "")[:8], when)
+            if it["stale"]:
+                head += yellow("   [newer runs exist but were cancelled/are running — no verdict since]")
+            print(head)
+            if it.get("first"):
+                f = it["first"]
+                t = it["tally"]
+                print("      first real failure: %s%s   (%d jobs: %s)" % (
+                    red(f["name"]), (" › " + f["step"]) if f["step"] else "", sum(t.values()), tally_str(t)))
+            for e in it["errors"][:4]:
+                print("      " + short(dim("│ ") + e, width - 6))
+            fb, lg = it["first_bad"], it["last_good"]
+            if lg is not None and fb is not None:
+                msg = ((fb.get("head_commit") or {}).get("message") or "").split("\n")[0]
+                print("      broke at: %s %s" % (yellow((fb.get("head_sha") or "")[:8]), short(msg, width - 30)))
+                lmsg = ((lg.get("head_commit") or {}).get("message") or "").split("\n")[0]
+                print("      last green: %s %s %s" % (green((lg.get("head_sha") or "")[:8]),
+                                                      dim(ago(parse_iso(lg.get("created_at"))) + " ago"),
+                                                      dim(short(lmsg, max(10, width - 45)))))
+            elif fb is not None:
+                # Honest about the limit: with no green anywhere in the window
+                # the oldest failure is NOT blame, it is just the edge of what
+                # we looked at.
+                msg = ((fb.get("head_commit") or {}).get("message") or "").split("\n")[0]
+                win = it.get("window", len(it["runs"]))
+                oldest = parse_iso((it["runs"][-1] if it["runs"] else {}).get("created_at"))
+                print("      oldest failure seen: %s %s" % (yellow((fb.get("head_sha") or "")[:8]),
+                                                            short(msg, width - 34)))
+                if win >= 20:
+                    print("      %s" % yellow("never green in %d runs of this workflow%s — "
+                                              "this is long-term red, not a fresh break"
+                                              % (win, " (back to %s ago)" % ago(oldest) if oldest else "")))
+                else:
+                    print("      %s" % yellow("never green in the last %d run(s) — not blame, just the "
+                                              "edge of the window (raise --limit)" % win))
+            if r.get("html_url"):
+                print("      " + dim(r["html_url"]))
+    print()
+    print(red("%d repo(s) red" % len(reds_all)) + dim(" of %d scanned" % len(repos)))
+    return 1
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# cmd: pushed / verify
+# ─────────────────────────────────────────────────────────────────────────
+
+PUSHED_HELP = """\
+zenpushed <rev> [repo]      is it ON THE TRUNK at origin? ("pushed" is a different fact)
+
+  --fetch       refresh origin refs first (uses `jj git fetch` in jj repos)
+  --quiet       exit status only
+Exit: 0 = on trunk, 1 = not on trunk, 2 = could not tell.
+"""
+
+
+def _fetch_origin(repo):
+    if os.path.exists(os.path.join(repo.path, ".jj")):
+        # In a colocated repo, drive the network through jj so git refs and
+        # jj's view of the world do not diverge.
+        rc, so, se = run(["jj", "git", "fetch"], cwd=repo.path, timeout=180)
+    else:
+        rc, so, se = run(["git", "fetch", "origin", "--quiet"], cwd=repo.path, timeout=180)
+    if rc != 0:
+        warn("fetch failed: %s" % (se or so).strip().split("\n")[0])
+
+
+def cmd_pushed(argv):
+    opts, args = parse_flags(argv, {}, {"--fetch", "--quiet", "-h", "--help"})
+    if "-h" in opts or "--help" in opts or not args:
+        print(PUSHED_HELP)
+        return 0 if args or "-h" in opts or "--help" in opts else 2
+    rev = args[0]
+    repo = repo_arg(args[1:])
+    if "--fetch" in opts:
+        _fetch_origin(repo)
+    sha = resolve_commit(repo, rev)
+    tr = repo.trunk
+    if not tr:
+        die("cannot determine the trunk branch for %s" % repo.name)
+    ref = trunk_ref(repo)
+    if not ref:
+        die("no local refs/remotes/origin/%s in %s — run with --fetch" % (tr, repo.path))
+    tip = out(["git", "rev-parse", ref], cwd=repo.path)
+    rc, _, _ = run(["git", "merge-base", "--is-ancestor", sha, ref], cwd=repo.path)
+    on = rc == 0
+    if "--quiet" in opts:
+        return 0 if on else 1
+    subject = out(["git", "log", "-1", "--format=%s", sha], cwd=repo.path)
+    reflog_age = _ref_age(repo, ref)
+    if on:
+        behind = out(["git", "rev-list", "--count", "%s..%s" % (sha, ref)], cwd=repo.path)
+        print("%s %s %s" % (green("ON TRUNK"), sha[:12], dim(short(subject, 60))))
+        print("  %s/%s @ %s  (%s commit(s) ahead of yours)" % (repo.name, tr, tip[:12], behind or "?"))
+        print("  " + dim("origin/%s last updated %s ago locally" % (tr, reflog_age)))
+        return 0
+    print("%s %s %s" % (red("NOT ON TRUNK"), sha[:12], dim(short(subject, 60))))
+    print("  %s/%s is at %s" % (repo.name, tr, tip[:12]))
+    print("  " + yellow("origin/%s was last updated %s ago locally — re-run with --fetch "
+                        "before believing this" % (tr, reflog_age)))
+    print("  " + dim("advance the bookmark:  jj bookmark set %s -r @- && jj git push --bookmark %s" % (tr, tr)))
+    print("  " + dim("`jj git push --change @-` pushes to an autogenerated push-* bookmark, NOT %s" % tr))
+    return 1
+
+
+def _ref_age(repo, ref):
+    ts = out(["git", "log", "-1", "--format=%cI", ref], cwd=repo.path)
+    p = os.path.join(repo.path, ".git", ref) if os.path.isdir(os.path.join(repo.path, ".git")) else None
+    if p and os.path.exists(p):
+        return ago(os.path.getmtime(p))
+    d = parse_iso(ts)
+    return ago(d) + " (commit date)" if d else "?"
+
+
+VERIFY_HELP = """\
+zenverify [rev] [options]   post-push sanity: on the trunk AND non-empty AND touches what you expect
+
+  default rev is `@-` in a jj repo (the last real commit), else HEAD
+  --expect <glob>   require a changed path matching this glob (repeatable)
+  --repo <name>     repo to check (default: cwd)
+  --fetch           refresh origin refs first
+Exit: 0 = every check passed.
+"""
+
+
+def cmd_verify(argv):
+    opts, args = parse_flags(argv, {"--repo": 1, "--expect": "many"},
+                             {"--fetch", "-h", "--help"})
+    if "-h" in opts or "--help" in opts:
+        print(VERIFY_HELP)
+        return 0
+    repo = repo_arg([opts["--repo"]] if "--repo" in opts else [])
+    is_jj = os.path.exists(os.path.join(repo.path, ".jj"))
+    rev = args[0] if args else ("@-" if is_jj else "HEAD")
+    if "--fetch" in opts:
+        _fetch_origin(repo)
+    sha = resolve_commit(repo, rev)
+    ok = True
+
+    print(bold("%s  %s  (trunk: %s)" % (repo.name, sha[:12], repo.trunk or "?")))
+
+    subject = out(["git", "log", "-1", "--format=%s", sha], cwd=repo.path)
+    body_ok = bool(subject.strip()) and subject.strip() != "(no description set)"
+    ok &= _check(body_ok, "has a description", subject.strip() or "(no description set)")
+
+    # TRAP: the jj empty-commit trap. Editing files BEFORE `jj new` snapshots
+    # them into the PREVIOUS change, so the change you then describe and push
+    # goes out EMPTY. It happened twice in one repo in one day. One
+    # `git show <sha> --stat` catches it — so make it a hard check.
+    files = out(["git", "diff-tree", "--no-commit-id", "--name-only", "-r", sha], cwd=repo.path)
+    changed = [f for f in files.splitlines() if f.strip()]
+    ok &= _check(bool(changed), "is NON-EMPTY",
+                 "%d file(s) changed" % len(changed) if changed else
+                 "EMPTY COMMIT — you probably edited before `jj new`; the edits are in the parent change")
+    if changed:
+        for f in changed[:8]:
+            print("      " + dim(f))
+        if len(changed) > 8:
+            print("      " + dim("… %d more" % (len(changed) - 8)))
+
+    ref = trunk_ref(repo)
+    if ref:
+        rc, _, _ = run(["git", "merge-base", "--is-ancestor", sha, ref], cwd=repo.path)
+        tip = out(["git", "rev-parse", ref], cwd=repo.path)[:12]
+        ok &= _check(rc == 0, "is on origin/%s" % repo.trunk,
+                     "origin/%s @ %s%s" % (repo.trunk, tip,
+                                           "" if rc == 0 else "  ← NOT AN ANCESTOR"))
+    else:
+        ok &= _check(False, "is on origin/%s" % (repo.trunk or "?"), "no local remote-tracking ref; use --fetch")
+
+    for pat in opts.get("--expect", []):
+        hit = [f for f in changed if fnmatch.fnmatch(f, pat) or pat in f]
+        ok &= _check(bool(hit), "touches %s" % pat, (hit[0] if hit else "no changed path matches"))
+
+    if is_jj:
+        wc = jj_head_commit(repo)
+        if wc:
+            # TRAP: in a colocated repo `git log -1` shows @-, not @. A naive
+            # `git log -1` therefore looks like your commit is missing.
+            print(dim("      note: jj working copy @ is %s (%s) — git HEAD tracks @-, so `git log -1` "
+                      "shows the parent, not your in-progress change"
+                      % (wc["commit"][:12], "empty" if wc["empty"] else "has changes")))
+    print(green("VERIFIED") if ok else red("VERIFY FAILED"))
+    return 0 if ok else 1
+
+
+def _check(cond, label, detail=""):
+    mark = green("  ✓") if cond else red("  ✗")
+    print("%s %-28s %s" % (mark, label, dim(detail) if cond else detail))
+    return bool(cond)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# cmd: claim / release / markers   (.workongoing protocol as verbs)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def agent_id():
+    return os.environ.get("ZEN_AGENT") or "claude-%s" % (os.uname().nodename.split(".")[0])
+
+
+def marker_path(repo):
+    return os.path.join(repo.path, ".workongoing")
+
+
+def read_marker(path):
+    try:
+        with open(path) as f:
+            line = f.readline().strip()
+    except OSError:
+        return None
+    parts = line.split(None, 2)
+    ts = parse_iso(parts[0]) if parts else None
+    return {"raw": line, "ts": ts, "agent": parts[1] if len(parts) > 1 else "?",
+            "activity": parts[2] if len(parts) > 2 else "", "path": path,
+            "age": (now_utc() - ts).total_seconds() if ts else None,
+            "mtime": os.path.getmtime(path)}
+
+
+def dirty_state(repo):
+    """(has_foreign_work, description). jj-aware.
+
+    The dangerous case is not 'a marker exists' — it is 'the working copy
+    holds somebody else's uncommitted edits'. That is what must block.
+    """
+    if os.path.exists(os.path.join(repo.path, ".jj")):
+        rc, so, se = run(["jj", "status", "--no-pager"], cwd=repo.path, timeout=60)
+        if rc != 0:
+            return False, "jj status failed"
+        lines = []
+        for line in so.splitlines():
+            if line.startswith("Working copy changes:"):
+                continue
+            if re.match(r"^[AMDR]\s", line):
+                lines.append(line.strip())
+            if line.startswith(("Working copy ", "Parent commit")):
+                break
+        return bool(lines), ("%d file(s) modified in @: %s" % (len(lines), "; ".join(lines[:3])) if lines
+                             else "@ is clean")
+    rc, so, _ = run(["git", "status", "--porcelain"], cwd=repo.path, timeout=60)
+    tracked = [ln for ln in so.splitlines() if not ln.startswith("??")]
+    untracked = [ln for ln in so.splitlines() if ln.startswith("??")]
+    if tracked:
+        return True, "%d tracked file(s) modified: %s" % (len(tracked), "; ".join(t[3:] for t in tracked[:3]))
+    return False, ("clean (%d untracked)" % len(untracked)) if untracked else "clean"
+
+
+CLAIM_HELP = """\
+zenclaim [repo] -m "<activity>"    write .workongoing, refusing when it is not safe
+
+Refuses when:
+  * a marker is fresh (< %ds) and owned by another agent
+  * the marker is stale BUT the working copy holds foreign uncommitted work
+    (the actually-dangerous case — that work may be a live concurrent session)
+Options: --force (loud override)  --refresh (bump timestamp only)  --stale N (seconds)
+""" % STALE_SECONDS
+
+
+def cmd_claim(argv):
+    opts, names = parse_flags(argv, {"-m": 1, "--message": 1, "--stale": 1},
+                              {"--force", "--refresh", "-h", "--help"})
+    if "-h" in opts or "--help" in opts:
+        print(CLAIM_HELP)
+        return 0
+    repo = repo_arg(names)
+    stale_secs = int(opts.get("--stale", STALE_SECONDS))
+    me = agent_id()
+    mp = marker_path(repo)
+    existing = read_marker(mp)
+    activity = (opts.get("-m") or opts.get("--message")
+                or (existing["activity"] if existing and "--refresh" in opts else None)
+                or "unspecified work")
+
+    if existing:
+        age = existing["age"]
+        fresh = age is not None and age < stale_secs
+        mine = existing["agent"] == me
+        if fresh and not mine and "--force" not in opts:
+            print(red("REFUSED") + " — %s is claimed by %s (%s ago)" % (repo.name, existing["agent"], ago(existing["ts"])))
+            print("  " + dim(existing["activity"]))
+            print("  " + dim("pick another repo, or wait; --force overrides (do not)"))
+            return 1
+        if not fresh and not mine:
+            foreign, desc = dirty_state(repo)
+            if foreign and "--force" not in opts:
+                print(red("REFUSED") + " — marker is stale (%s) but @ holds work that is not yours" % ago(existing["ts"]))
+                print("  " + desc)
+                print("  " + yellow("this may be a crashed OR a live session's uncommitted work — do not clobber it"))
+                print("  " + dim("inspect: jj status; jj log; jj op log     then --force only if you are certain"))
+                return 1
+    else:
+        # No marker at all: still refuse if the tree holds foreign work AND we
+        # were not the last to touch it — silence is not consent.
+        foreign, desc = dirty_state(repo)
+        if foreign and "--force" not in opts and "--refresh" not in opts:
+            warn("%s has uncommitted work and no marker: %s" % (repo.name, desc))
+            warn("claiming anyway, but do NOT discard those changes (see CLAUDE.md)")
+
+    line = "%s %s %s\n" % (iso_now(), me, activity)
+    with open(mp, "w") as f:
+        f.write(line)
+    print(green("CLAIMED") + " %s  %s" % (repo.name, dim(line.strip())))
+    _gitignore_check(repo)
+    return 0
+
+
+def _gitignore_check(repo):
+    gi = os.path.join(repo.path, ".gitignore")
+    try:
+        with open(gi) as f:
+            if ".workongoing" in f.read():
+                return
+    except OSError:
+        pass
+    warn("%s/.gitignore does not list .workongoing — add it in your next commit:" % repo.name)
+    sys.stderr.write("        echo .workongoing >> %s\n" % gi)
+
+
+RELEASE_HELP = """\
+zenrelease [repo] [options]     drop the marker when you are done
+
+  --pause "<reason>"   keep the marker but rewrite it as paused, for the next agent
+  --force              release a marker owned by another agent
+"""
+
+
+def cmd_release(argv):
+    opts, names = parse_flags(argv, {"--pause": 1}, {"--force", "-h", "--help"})
+    if "-h" in opts or "--help" in opts:
+        print(RELEASE_HELP)
+        return 0
+    repo = repo_arg(names)
+    mp = marker_path(repo)
+    m = read_marker(mp)
+    if not m:
+        print(dim("no marker in %s" % repo.name))
+        return 0
+    if m["agent"] != agent_id() and "--force" not in opts:
+        print(red("REFUSED") + " — marker belongs to %s (%s ago); --force to override"
+              % (m["agent"], ago(m["ts"])))
+        return 1
+    if "--pause" in opts:
+        with open(mp, "w") as f:
+            f.write("%s %s paused-%s\n" % (iso_now(), agent_id(), opts["--pause"].replace(" ", "-")))
+        print(yellow("PAUSED") + " %s — marker left in place for the next agent" % repo.name)
+        return 0
+    os.remove(mp)
+    print(green("RELEASED") + " %s" % repo.name)
+    return 0
+
+
+MARKERS_HELP = """\
+zenmarkers [repo…] [options]    audit .workongoing across every root — find leaks
+
+Classes: LIVE (fresh) · PAUSED (deliberate) · STALE+WORK (do not touch) · LEAKED (stale, tree clean)
+  --all      include non-owned repos    --prune   list leaked markers to remove
+  --prune --yes   actually remove them  --stale N seconds (default %d)
+""" % STALE_SECONDS
+
+
+def cmd_markers(argv):
+    opts, names = parse_flags(argv, {"--stale": 1}, {"--all", "--prune", "--yes", "-h", "--help"})
+    if "-h" in opts or "--help" in opts:
+        print(MARKERS_HELP)
+        return 0
+    stale_secs = int(opts.get("--stale", STALE_SECONDS))
+    repos = select_repos(names, all_repos="--all" in opts, include_worktrees=True)
+
+    def scan(repo):
+        m = read_marker(marker_path(repo))
+        if not m:
+            return None
+        cls, why = "LEAKED", "stale, tree clean → safe to prune"
+        if m["age"] is None:
+            cls, why = "MALFORMED", "unparseable timestamp: %r" % m["raw"][:40]
+        elif m["age"] < stale_secs:
+            cls, why = "LIVE", "claimed %s ago — back off" % ago(m["ts"])
+        elif "paused" in m["activity"].lower():
+            cls, why = "PAUSED", "deliberate pause, left for the next agent"
+        else:
+            foreign, desc = dirty_state(repo)
+            if foreign:
+                cls, why = "STALE+WORK", desc + " → do NOT clobber; ask first"
+        if m["agent"] == agent_id() and cls != "LIVE":
+            why += "  (yours — `zenclaim --refresh` to keep it)"
+        return (repo, m, cls, why)
+
+    rows = [r for r in pmap(scan, repos, workers=10) if r]
+    if not rows:
+        print(green("no .workongoing markers anywhere") + dim(" (%d repos scanned)" % len(repos)))
+        return 0
+    order = {"LIVE": 0, "STALE+WORK": 1, "PAUSED": 2, "MALFORMED": 3, "LEAKED": 4}
+    rows.sort(key=lambda r: (order.get(r[2], 9), r[0].name))
+    style = {"LIVE": blue, "STALE+WORK": red, "PAUSED": yellow, "LEAKED": dim, "MALFORMED": red}
+    namew = max(len(r[0].name) for r in rows)
+    w = term_width()
+    for repo, m, cls, why in rows:
+        print("%-10s %-*s %-6s %-22s %s" % (style[cls](cls), namew, repo.name,
+                                            ago(m["ts"]), short(m["agent"], 22), dim(short(why, max(20, w - namew - 45)))))
+        if m["activity"]:
+            print("           " + dim(short(m["activity"], w - 12)))
+    leaked = [r for r in rows if r[2] == "LEAKED"]
+    if leaked and "--prune" in opts:
+        print()
+        for repo, m, _, _ in leaked:
+            if "--yes" in opts:
+                os.remove(m["path"])
+                print(green("pruned ") + m["path"])
+            else:
+                print(dim("would remove: ") + m["path"])
+        if "--yes" not in opts:
+            print(dim("re-run with --prune --yes to remove them"))
+    elif leaked:
+        print()
+        print(dim("%d leaked marker(s); `zenmarkers --prune` to review" % len(leaked)))
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# cmd: fmt
+# ─────────────────────────────────────────────────────────────────────────
+
+FMT_HELP = """\
+zenfmt [repo] [options]     cargo fmt, ALWAYS package-scoped, never --all
+
+  --check       cargo fmt --check (scoped); lists files that need formatting
+  --classify    classify the CURRENT working-tree diff as reflow vs logic, with reasons
+  -p <pkg>      restrict to these packages (default: every workspace member)
+  --dirty-ok    format even though the tree is dirty (default: refuse, per CLAUDE.md)
+
+TRAP: `cargo fmt --all` follows local path-dependencies into SIBLING REPOS and
+silently reformats them (confirmed: it edited ../zenav1-aom). Package scoping is
+the fix, and this command prints which path deps escape the repo.
+"""
+
+
+def workspace_packages(repo):
+    # --frozen first: plain `cargo metadata` will happily rewrite Cargo.lock,
+    # and a status/format tool must not mutate a repo as a side effect.
+    base = ["cargo", "metadata", "--no-deps", "--format-version", "1"]
+    rc, so, se = run(base + ["--frozen"], cwd=repo.path, timeout=180)
+    if rc != 0:
+        rc, so, se = run(base, cwd=repo.path, timeout=180)
+        if rc == 0:
+            warn("Cargo.lock was stale; `cargo metadata` may have refreshed it in %s" % repo.name)
+    if rc != 0:
+        return [], (se or so).strip().split("\n")[-1][:200]
+    try:
+        meta = json.loads(so)
+    except ValueError:
+        return [], "unparseable cargo metadata"
+    return [p["name"] for p in meta.get("packages", [])], None
+
+
+def escaping_path_deps(repo):
+    """Path deps that resolve OUTSIDE the repo — what --all would have touched."""
+    escapes = []
+    root = os.path.realpath(repo.path)
+    for dirpath, dirnames, filenames in os.walk(repo.path):
+        dirnames[:] = [d for d in dirnames if d not in ("target", ".git", ".jj", "node_modules")]
+        if "Cargo.toml" not in filenames:
+            continue
+        mp = os.path.join(dirpath, "Cargo.toml")
+        try:
+            with open(mp) as f:
+                text = f.read()
+        except OSError:
+            continue
+        for rel in re.findall(r'path\s*=\s*"([^"]+)"', text):
+            target = os.path.realpath(os.path.join(dirpath, rel))
+            if not (target == root or target.startswith(root + os.sep)):
+                escapes.append((os.path.relpath(mp, repo.path), rel, target))
+    return escapes
+
+
+def cmd_fmt(argv):
+    opts, names = parse_flags(argv, {"-p": "many", "--package": "many"},
+                              {"--check", "--classify", "--dirty-ok", "-h", "--help"})
+    if "-h" in opts or "--help" in opts:
+        print(FMT_HELP)
+        return 0
+    repo = repo_arg(names)
+    if "--classify" in opts:
+        return classify_diff(repo)
+
+    pkgs = opts.get("-p", []) + opts.get("--package", [])
+    err = None
+    if not pkgs:
+        pkgs, err = workspace_packages(repo)
+    if err:
+        die("cargo metadata failed in %s: %s" % (repo.path, err))
+    if not pkgs:
+        die("no workspace packages found in %s" % repo.path)
+
+    esc = escaping_path_deps(repo)
+    if esc:
+        targets = sorted(set(t for _, _, t in esc))
+        warn("%d path dep(s) reach %d dir(s) OUTSIDE this repo — `cargo fmt --all` would reformat them:"
+             % (len(esc), len(targets)))
+        for t in targets[:12]:
+            missing = "" if os.path.isdir(t) else "   ← does not exist (broken path dep)"
+            sys.stderr.write("        %s%s\n" % (t, missing))
+        if len(targets) > 12:
+            sys.stderr.write("        … %d more\n" % (len(targets) - 12))
+        sys.stderr.write("        " + "this command passes -p per member instead, so they are untouched\n")
+
+    args = ["cargo", "fmt"]
+    for p in pkgs:
+        args += ["-p", p]
+    if "--check" in opts:
+        args += ["--", "--check"]
+    else:
+        foreign, desc = dirty_state(repo)
+        if foreign and "--dirty-ok" not in opts:
+            print(red("REFUSED") + " — %s has uncommitted changes: %s" % (repo.name, desc))
+            print("  " + dim("CLAUDE.md: run cargo fmt on a CLEAN worktree and commit first."))
+            print("  " + dim("`zenfmt --classify` tells you whether that dirt is reflow or logic."))
+            print("  " + dim("--dirty-ok overrides."))
+            return 1
+    print(dim("$ " + " ".join(args[:4]) + (" … (%d packages)" % len(pkgs) if len(pkgs) > 2 else "")))
+    rc, so, se = run(args, cwd=repo.path, timeout=600)
+    if so.strip():
+        print(so.rstrip())
+    if rc != 0:
+        files = sorted(set(re.findall(r"^Diff in (\S+)", se, re.M)))
+        if files:
+            print(red("needs formatting: %d file(s)" % len(files)))
+            for f in files[:20]:
+                print("  " + os.path.relpath(f, repo.path))
+        else:
+            print(se.rstrip())
+        return rc
+    print(green("ok") + dim("  (%d packages: %s)" % (len(pkgs), short(", ".join(pkgs), 90))))
+    return 0
+
+
+WS_RE = re.compile(r"\s+")
+
+
+def normalize_rust(s):
+    """Collapse everything rustfmt is allowed to move around.
+
+    Whitespace, plus the trailing comma rustfmt inserts when a call/list is
+    reflowed onto multiple lines. That comma is the exact reason a plain
+    `git diff -w` reports "not whitespace-only" on a pure formatting change
+    and reads as UNSAFE to a reviewer who does not know the trick.
+    """
+    s = WS_RE.sub("", s)
+    s = re.sub(r",(?=[)\]}>])", "", s)
+    return s.rstrip(",")
+
+
+COMMENT_RE = re.compile(r"//.*$|/\*.*?\*/", re.S)
+
+
+def classify_diff(repo):
+    """Explain, hunk by hunk, whether the working-tree diff is reflow or logic."""
+    rc, so, se = run(["git", "--no-pager", "diff", "-U0", "--no-color"], cwd=repo.path, timeout=120)
+    if rc != 0:
+        die("git diff failed: %s" % se.strip())
+    if not so.strip():
+        print(dim("working tree is clean — nothing to classify"))
+        return 0
+    cur_file = None
+    hunks = []
+    minus, plus, hdr, hunk_file = [], [], None, None
+    for line in so.splitlines():
+        if line.startswith("+++ b/"):
+            cur_file = line[6:]
+        elif line.startswith("@@"):
+            if hdr is not None:
+                hunks.append((hunk_file, hdr, minus, plus))
+            # Bind the file NOW: cur_file advances at the next `+++ b/`, so
+            # flushing a hunk lazily attributes it to the following file.
+            hdr, minus, plus, hunk_file = line, [], [], cur_file
+        elif hdr is not None and line.startswith("-") and not line.startswith("---"):
+            minus.append(line[1:])
+        elif hdr is not None and line.startswith("+") and not line.startswith("+++"):
+            plus.append(line[1:])
+    if hdr is not None:
+        hunks.append((hunk_file, hdr, minus, plus))
+
+    reflow = logic = comment = comma = 0
+    w = term_width()
+    for f, hdr, minus, plus in hunks:
+        loc = re.search(r"\+(\d+)", hdr)
+        where = "%s:%s" % (f, loc.group(1) if loc else "?")
+        a, b = "\n".join(minus), "\n".join(plus)
+        na, nb = normalize_rust(a), normalize_rust(b)
+        if na == nb:
+            reflow += 1
+            why = "identical after whitespace normalization"
+            if WS_RE.sub("", a) != WS_RE.sub("", b):
+                comma += 1
+                why = ("identical after whitespace + trailing-comma normalization — this is the "
+                       "hunk a naive `diff -w` calls NON-whitespace and you call unsafe; it is rustfmt reflow")
+            print("%s %-44s %s" % (green("REFLOW"), short(where, 44), dim(short(why, max(20, w - 55)))))
+            continue
+        # Comment-text-only change is still a real change per CLAUDE.md.
+        if COMMENT_RE.sub("", na) == COMMENT_RE.sub("", nb):
+            comment += 1
+            logic += 1
+            print("%s %-44s %s" % (red("COMMENT"), short(where, 44),
+                                   "comment TEXT changed — treat as intentional WIP, not fmt"))
+        else:
+            logic += 1
+            print("%s %-44s %s" % (red("LOGIC "), short(where, 44), "differs after normalization:"))
+        for ln in minus[:3]:
+            print("        " + red("- " + short(ln.strip(), w - 12)))
+        for ln in plus[:3]:
+            print("        " + green("+ " + short(ln.strip(), w - 12)))
+    print()
+    print("%d hunk(s): %s reflow (%d of them differ only by a trailing comma), %s logic%s"
+          % (len(hunks), green(str(reflow)), comma, red(str(logic)),
+             " (%d comment-text)" % comment if comment else ""))
+    if logic == 0 and reflow:
+        print(green("VERDICT: formatting only") +
+              " — safe to commit as `style: cargo fmt` (CLAUDE.md permits committing, never discarding)")
+        return 0
+    if logic:
+        print(red("VERDICT: contains real changes") +
+              " — this is intentional WIP. Do NOT launder it into a `style:` commit.")
+    return 1
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# cmd: space
+# ─────────────────────────────────────────────────────────────────────────
+
+SPACE_HELP = """\
+zenspace [options]          largest UNCLAIMED cargo target dirs, and what reclaiming them buys
+
+  --need 40G     how much free space you want; selects the smallest set that gets there
+  --reclaim      print the rm commands for the selection
+  --reclaim --yes  actually remove them
+  --hot N        minutes; a target touched more recently is treated as an active build (default 20)
+  --all          include non-owned repos    --min 200M  ignore targets smaller than this
+
+Never selects a repo holding a live .workongoing marker, and never a target that
+looks like an in-flight build.
+"""
+
+
+def dir_size(path):
+    rc, so, _ = run(["du", "-sk", path], timeout=300)
+    if rc != 0:
+        return 0
+    try:
+        return int(so.split()[0]) * 1024
+    except (ValueError, IndexError):
+        return 0
+
+
+def cmd_space(argv):
+    opts, names = parse_flags(argv, {"--need": 1, "--hot": 1, "--min": 1},
+                              {"--reclaim", "--yes", "--all", "-h", "--help"})
+    if "-h" in opts or "--help" in opts:
+        print(SPACE_HELP)
+        return 0
+    hot_secs = int(opts.get("--hot", 20)) * 60
+    min_size = parse_size(opts.get("--min", "200M"))
+    repos = select_repos(names, all_repos="--all" in opts, include_worktrees=True)
+
+    targets = []
+    for r in repos:
+        for sub in ("target", os.path.join("fuzz", "target")):
+            p = os.path.join(r.path, sub)
+            if os.path.isdir(p):
+                targets.append((r, p))
+
+    def measure(item):
+        repo, path = item
+        size = dir_size(path)
+        mtime = os.path.getmtime(path)
+        marker = read_marker(marker_path(repo))
+        live = bool(marker and marker["age"] is not None and marker["age"] < STALE_SECONDS)
+        hot = (time.time() - mtime) < hot_secs
+        return {"repo": repo, "path": path, "size": size, "mtime": mtime,
+                "live": live, "hot": hot, "marker": marker}
+
+    rows = [r for r in pmap(measure, targets, workers=10) if r["size"] >= min_size]
+    rows.sort(key=lambda r: -r["size"])
+
+    du = shutil.disk_usage(os.path.dirname(WORKSPACE))
+    print("%s free of %s on %s" % (bold(human_size(du.free)), human_size(du.total),
+                                   os.path.dirname(WORKSPACE)))
+    total = sum(r["size"] for r in rows)
+    print(dim("%d target dirs ≥ %s, %s total" % (len(rows), human_size(min_size), human_size(total))))
+    print()
+
+    need = parse_size(opts["--need"]) if "--need" in opts else None
+    selected, acc = [], 0
+    w = term_width()
+    for r in rows:
+        blocked = None
+        if r["live"]:
+            blocked = "claimed by %s %s ago" % (r["marker"]["agent"], ago(r["marker"]["ts"]))
+        elif r["hot"]:
+            blocked = "touched %s ago — build may be running" % ago(r["mtime"])
+        pick = ""
+        if blocked is None and (need is None or acc < max(0, need - du.free)):
+            if need is not None:
+                selected.append(r)
+                acc += r["size"]
+                pick = green(" ← reclaim")
+            else:
+                selected.append(r)
+        label = os.path.relpath(r["path"], os.path.dirname(WORKSPACE))
+        print("%8s  %-46s %s%s" % (human_size(r["size"]), short(label, 46),
+                                   dim("idle %s" % ago(r["mtime"])) if not blocked else yellow("SKIP: " + blocked),
+                                   pick))
+    if need is not None:
+        short_by = max(0, need - du.free)
+        print()
+        if short_by == 0:
+            print(green("already have %s free — nothing to do" % human_size(du.free)))
+            return 0
+        print("need %s more; selection frees %s from %d dir(s)%s"
+              % (human_size(short_by), human_size(acc), len(selected),
+                 "" if acc >= short_by else red(" — NOT ENOUGH")))
+    if "--reclaim" in opts:
+        print()
+        for r in selected:
+            if "--yes" in opts:
+                shutil.rmtree(r["path"], ignore_errors=True)
+                print(green("removed ") + r["path"] + dim("  (%s)" % human_size(r["size"])))
+            else:
+                print("rm -rf %s" % r["path"] + dim("   # %s" % human_size(r["size"])))
+        if "--yes" not in opts:
+            print(dim("re-run with --reclaim --yes to remove them"))
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# arg parsing + dispatch
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def parse_flags(argv, valued, flags):
+    """Tiny parser. `valued` maps flag -> 1 (single) or "many" (repeatable)."""
+    opts, positional = {}, []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            positional.extend(argv[i + 1 :])
+            break
+        if a in valued:
+            if i + 1 >= len(argv):
+                die("%s needs a value" % a)
+            if valued[a] == "many":
+                opts.setdefault(a, []).append(argv[i + 1])
+            else:
+                opts[a] = argv[i + 1]
+            i += 2
+            continue
+        if a in flags:
+            opts[a] = True
+            i += 1
+            continue
+        if a.startswith("-") and a != "-":
+            die("unknown option %r" % a)
+        positional.append(a)
+        i += 1
+    return opts, positional
+
+
+COMMANDS = {
+    "ci": (cmd_ci, "CI verdicts per workflow — cancelled is NOT a pass"),
+    "red": (cmd_red, "what is broken right now, first error line, blame commit"),
+    "pushed": (cmd_pushed, "is a commit actually on the trunk at origin?"),
+    "verify": (cmd_verify, "post-push: on trunk AND non-empty AND touches what you expect"),
+    "claim": (cmd_claim, "write .workongoing, refusing when unsafe"),
+    "release": (cmd_release, "drop or pause .workongoing"),
+    "markers": (cmd_markers, "audit .workongoing across the tree; find leaks"),
+    "fmt": (cmd_fmt, "package-scoped cargo fmt + reflow-vs-logic diff classifier"),
+    "space": (cmd_space, "largest unclaimed cargo target dirs; --reclaim to act"),
+}
+
+TOP_HELP = """\
+zen — cross-workspace signal-to-noise tools for the zen crate tree
+
+  usage:  zen <command> [args]        or the symlinked form:  zen<command> [args]
+
+""" + "\n".join("  %-9s %s" % (k, v[1]) for k, v in sorted(COMMANDS.items())) + """
+
+  every command takes -h.  repos are discovered under %s
+  (override with ZEN_ROOTS=/a:/b).  set ZEN_AGENT to a stable id per agent session.
+""" % ", ".join(default_roots())
+
+
+def main(argv):
+    prog = os.path.basename(argv[0])
+    args = argv[1:]
+    sub = None
+    if prog.startswith("zen") and prog[3:] in COMMANDS:
+        sub = prog[3:]
+    elif args and args[0] in COMMANDS:
+        sub, args = args[0], args[1:]
+    elif args and args[0] in ("-h", "--help", "help"):
+        print(TOP_HELP)
+        return 0
+    if sub is None:
+        print(TOP_HELP)
+        return 0 if not args else 2
+    if not shutil.which("gh") and sub in ("ci", "red"):
+        die("gh CLI not found; `brew install gh` / see https://cli.github.com")
+    try:
+        return COMMANDS[sub][0](args)
+    except KeyboardInterrupt:
+        return 130
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1797,6 +1797,775 @@ def cmd_space(argv):
 # ─────────────────────────────────────────────────────────────────────────
 
 
+UNIFY_HELP = """\
+zen unify — one Cargo view over the whole tree, reversibly
+
+  usage:  zen unify plan            what a unified view could claim, and what blocks it
+          zen unify doctor          defects a unified view would expose (run this first)
+          zen unify on  [layers]    turn it on
+          zen unify off             turn it all off and restore every rewritten manifest
+          zen unify status          what is on right now, and is anything dirty
+
+  layers (each independent, cheapest first; `on` with no layer = --patch only):
+    --patch        <root>/.cargo/config.toml with one [patch.crates-io] table.
+                   No manifest is touched. Reaches nested standalone sub-workspaces
+                   (fuzz/, apidoc/) that a parent Cargo.toml cannot. Undo = rm.
+    --workspace    also <root>/Cargo.toml claiming every crate it can, excluding the
+                   rest. One lock for the claimed set.
+    --materialize  also rewrite `foo.workspace = true` in member manifests to the
+                   literal value from their OWN repo root, so repos that use
+                   [workspace.package]/[workspace.dependencies] can be claimed too.
+                   Backups live OUTSIDE the repos, in <root>/.zenunify/backups/.
+
+  --root DIR       parent directory to unify (default: %s)
+  -n, --dry-run    print what would be written; write nothing
+
+TRAP: a member cannot inherit `version.workspace = true` from a root that is not its
+workspace root. Claiming a crate whose repo defines [workspace.package] fails with
+"`workspace.package.version` was not defined" — the parent cannot supply it, because
+the repos disagree on version/license/repository. --materialize is the way through.
+
+TRAP: cargo does not canonicalize path deps. `../../butteraugli/butteraugli` through a
+symlinked repo alias and `../../zen/butteraugli/butteraugli` are two different packages
+under one lock: "package collision in the lockfile". `doctor` finds these.
+
+TRAP: with a patch table above the tree, `cargo package`/`cargo publish --dry-run` is
+NOT registry truth. The verify build unpacks into <repo>/target/package/, which is
+inside the tree, so it walks up and finds the patch table. It compiles the local
+sibling and passes. Build the .crate OUTSIDE the tree to check registry truth.
+""" % os.path.dirname(WORKSPACE)
+
+_UNIFY_DIRNAME = ".zenunify"
+_SKIP_DIRS = (".git", ".jj", ".claude", "target", "node_modules")
+
+
+def _toml_load(path):
+    """tomllib is 3.11+. This command needs a real parser — regex will not do."""
+    try:
+        import tomllib
+    except ImportError:
+        die("zen unify needs python 3.11+ (tomllib); this is %d.%d"
+            % (sys.version_info[0], sys.version_info[1]))
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def _toml_val(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, str):
+        return json.dumps(v)
+    if isinstance(v, list):
+        return "[" + ", ".join(_toml_val(x) for x in v) + "]"
+    if isinstance(v, dict):
+        return "{ " + ", ".join("%s = %s" % (k, _toml_val(x)) for k, x in v.items()) + " }"
+    raise TypeError(type(v))
+
+
+def unify_root(opts):
+    return os.path.abspath(os.path.expanduser(opts.get("--root", os.path.dirname(WORKSPACE))))
+
+
+def _scan_dirs(root):
+    """root itself, plus each configured scan dir that lives under it."""
+    dirs = [root]
+    for d in default_roots():
+        d = os.path.abspath(d)
+        if d != root and d.startswith(root + os.sep) and os.path.isdir(d):
+            dirs.append(d)
+    return dirs
+
+
+def _walk_manifests(top):
+    for dirpath, dirnames, filenames in os.walk(top):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        if "Cargo.toml" in filenames:
+            yield os.path.join(dirpath, "Cargo.toml")
+
+
+def _inherited(manifest_table):
+    """Which `workspace = true` inheritances a manifest uses."""
+    got = {"pkg": [], "dep": [], "lints": False}
+    sections = ["dependencies", "dev-dependencies", "build-dependencies"]
+
+    def scan(tbl, prefix):
+        for sect in sections:
+            for name, spec in (tbl.get(sect) or {}).items():
+                if isinstance(spec, dict) and spec.get("workspace") is True:
+                    got["dep"].append((prefix + sect, name))
+
+    scan(manifest_table, "")
+    for tgt, tv in (manifest_table.get("target") or {}).items():
+        scan(tv, "target.%s." % tgt)
+    for k, v in (manifest_table.get("package") or {}).items():
+        if isinstance(v, dict) and v.get("workspace") is True:
+            got["pkg"].append(k)
+    if (manifest_table.get("lints") or {}).get("workspace") is True:
+        got["lints"] = True
+    return got
+
+
+def classify_repos(root):
+    """Every repo dir under the root, and whether a parent workspace could claim it."""
+    import glob as _glob
+    scans = _scan_dirs(root)
+    out, seen = [], set()
+    for scan in scans:
+        for name in sorted(os.listdir(scan)):
+            d = os.path.join(scan, name)
+            if not os.path.isdir(d) or name.startswith(".") or d in scans:
+                continue
+            info = {"dir": d, "rel": os.path.relpath(d, root), "kind": "no-manifest",
+                    "members": [], "blockers": [], "notes": [], "lints": {}, "subws": [],
+                    "alias": os.path.islink(d), "inherit": {}}
+            if info["alias"]:
+                # TRAP: a symlinked repo alias must be excluded, never claimed. A path dep
+                # written through the alias resolves to a *different* manifest path for the
+                # same package name, and one lock cannot hold both.
+                info["notes"].append("symlink -> %s" % os.path.relpath(os.path.realpath(d), root))
+                out.append(info)
+                continue
+            real = os.path.realpath(d)
+            if real in seen:
+                continue
+            seen.add(real)
+            rootman = os.path.join(d, "Cargo.toml")
+            if os.path.exists(rootman):
+                try:
+                    t = _toml_load(rootman)
+                except Exception as e:
+                    info["blockers"].append("root manifest unparseable: %s" % e)
+                    out.append(info)
+                    continue
+                info["root_table"] = t
+                ws = t.get("workspace")
+                if ws is None:
+                    info["kind"] = "plain-package"
+                    info["members"] = [d]
+                else:
+                    info["kind"] = "hybrid" if "package" in t else "virtual"
+                    info["lints"] = ws.get("lints") or {}
+                    for pat in ws.get("members", []):
+                        for hit in sorted(_glob.glob(os.path.join(d, pat))):
+                            if not os.path.exists(os.path.join(hit, "Cargo.toml")):
+                                continue
+                            if os.path.realpath(hit) == real:
+                                # a hybrid root listing itself ("."): the [workspace] table
+                                # travels with the package, so it can never be a member
+                                continue
+                            info["members"].append(hit)
+                    if info["kind"] == "hybrid":
+                        info["notes"].append(
+                            "root package `%s` stays out: its manifest declares [workspace]"
+                            % (t.get("package") or {}).get("name"))
+                for man in _walk_manifests(d):
+                    if man == rootman:
+                        continue
+                    try:
+                        sub = _toml_load(man)
+                    except Exception:
+                        continue
+                    if sub.get("workspace") is not None:
+                        info["subws"].append(os.path.dirname(man))
+            for m in info["members"]:
+                try:
+                    mt = _toml_load(os.path.join(m, "Cargo.toml"))
+                except Exception:
+                    continue
+                got = _inherited(mt)
+                keys = ["package.%s" % k for k in got["pkg"]] + \
+                       ["%s.%s" % (s, n) for s, n in got["dep"]] + \
+                       (["lints"] if got["lints"] else [])
+                if keys:
+                    info["inherit"][os.path.relpath(m, d)] = keys
+            hard = dict((k, [x for x in v if x != "lints"])
+                        for k, v in info["inherit"].items())
+            hard = dict((k, v) for k, v in hard.items() if v)
+            info["hard_inherit"] = hard
+            if hard:
+                info["blockers"].append(
+                    "%d member(s) inherit from this repo's own [workspace.package]/"
+                    "[workspace.dependencies] — needs --materialize" % len(hard))
+            out.append(info)
+    out.sort(key=lambda i: i["rel"])
+    return out
+
+
+def local_crates(root):
+    """crate name -> (manifest dir, version) for every package on disk under the root."""
+    found, dupes = {}, {}
+    scans = _scan_dirs(root)
+    for scan in scans:
+        for name in sorted(os.listdir(scan)):
+            d = os.path.join(scan, name)
+            if not os.path.isdir(d) or os.path.islink(d) or name.startswith(".") or d in scans:
+                continue
+            for man in _walk_manifests(d):
+                parts = os.path.relpath(man, d).split(os.sep)
+                if "apidoc" in parts or "fuzz" in parts:
+                    continue
+                try:
+                    t = _toml_load(man)
+                except Exception:
+                    continue
+                pkg = t.get("package") or {}
+                nm = pkg.get("name")
+                if not nm:
+                    continue
+                ver = pkg.get("version")
+                if isinstance(ver, dict):      # version.workspace = true
+                    ver = ((t.get("workspace") or {}).get("package") or {}).get("version")
+                if nm in found:
+                    dupes.setdefault(nm, [found[nm][0]]).append(os.path.dirname(man))
+                    continue
+                found[nm] = (os.path.dirname(man), ver)
+    return found, dupes
+
+
+def gen_patch_config(root, wanted=None):
+    found, dupes = local_crates(root)
+    lines = [
+        "# GENERATED by `zen unify` — regenerate, do not hand-edit.",
+        "# Paths are relative to the directory holding .cargo/, NOT the cwd.",
+        "# Cargo discovers this by walking up, so nested standalone workspaces",
+        "# (fuzz/, apidoc/) inherit it — a parent Cargo.toml does not reach them.",
+        "",
+        "[patch.crates-io]",
+    ]
+    for nm, (d, ver) in sorted(found.items()):
+        if wanted is not None and nm not in wanted:
+            continue
+        lines.append('%s = { path = "%s" }%s'
+                     % (nm, os.path.relpath(d, root), ("  # %s" % ver) if ver else ""))
+    for nm, ds in sorted(dupes.items()):
+        lines.append("# AMBIGUOUS %s: %s" % (nm, ", ".join(os.path.relpath(x, root) for x in ds)))
+    return "\n".join(lines) + "\n", found, dupes
+
+
+def gen_workspace_manifest(root, repos):
+    claimed, excluded, lints, notes = [], [], {}, []
+    for r in repos:
+        excluded.append(r["rel"])
+        for sw in r["subws"]:
+            excluded.append(os.path.relpath(sw, root))
+        for n in r["notes"]:
+            notes.append("# note   %-22s %s" % (r["rel"], n))
+        if r["alias"]:
+            continue
+        if r["blockers"]:
+            notes.append("# SKIP   %-22s %s" % (r["rel"], "; ".join(r["blockers"])))
+            continue
+        if not r["members"]:
+            continue
+        for m in r["members"]:
+            claimed.append(os.path.relpath(m, root))
+        # only repos whose members STILL say `lints.workspace = true` need the parent to
+        # carry a table; --materialize inlines them per-member, which is always correct.
+        if any("lints" in keys for keys in r["inherit"].values()):
+            for group, body in (r["lints"] or {}).items():
+                cur = lints.setdefault(group, {})
+                for k, v in body.items():
+                    if k in cur and cur[k] != v:
+                        notes.append("# LINT CONFLICT %s.%s: %r kept, %r wanted by %s "
+                                     "— use --materialize to give each member its own"
+                                     % (group, k, cur[k], v, r["rel"]))
+                    cur.setdefault(k, v)
+    text = ["# GENERATED by `zen unify` — do not edit; regenerate instead.",
+            "# Every repo directory is excluded; explicit `members` entries win over exclude.",
+            "# `zen unify off` deletes this file.",
+            "[workspace]",
+            'resolver = "2"',
+            "members = ["]
+    text += ['  "%s",' % m for m in claimed]
+    text += ["]", "exclude = ["]
+    text += ['  "%s",' % e for e in sorted(set(excluded))]
+    text += ["]"]
+    for group, body in sorted(lints.items()):
+        text.append("")
+        text.append("[workspace.lints.%s]" % group)
+        for k, v in sorted(body.items()):
+            text.append("%s = %s" % (k, _toml_val(v)))
+    text.append("")
+    text += notes
+    return "\n".join(text) + "\n", claimed, notes
+
+
+# ── reversible manifest rewriting ────────────────────────────────────────
+#
+# Backups live in <root>/.zenunify/backups/, NEVER beside the manifest.
+# TRAP: a Cargo.toml.bak sitting next to a Cargo.toml IS PACKAGED — a stray
+# backup file shipped inside a .crate in testing. Keep them out of the repos.
+
+def _backup_dir(root):
+    return os.path.join(root, _UNIFY_DIRNAME, "backups")
+
+
+def _backup_path(root, manifest):
+    import hashlib
+    h = hashlib.sha1(os.path.abspath(manifest).encode()).hexdigest()[:16]
+    return os.path.join(_backup_dir(root), "%s.toml" % h)
+
+
+def _save_backup(root, manifest, text):
+    p = _backup_path(root, manifest)
+    if os.path.exists(p):
+        return
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w") as f:
+        f.write(text)
+    with open(os.path.join(_backup_dir(root), "index.tsv"), "a") as f:
+        f.write("%s\t%s\n" % (os.path.basename(p), os.path.abspath(manifest)))
+
+
+def restore_backups(root, dry=False):
+    idx = os.path.join(_backup_dir(root), "index.tsv")
+    if not os.path.exists(idx):
+        return 0, []
+    n, failed = 0, []
+    with open(idx) as f:
+        entries = [ln.rstrip("\n").split("\t") for ln in f if "\t" in ln]
+    for base, manifest in entries:
+        src = os.path.join(_backup_dir(root), base)
+        if not os.path.exists(src):
+            continue
+        if dry:
+            n += 1
+            continue
+        try:
+            with open(src) as a:
+                text = a.read()
+            with open(manifest, "w") as b:
+                b.write(text)
+            os.remove(src)
+            n += 1
+        except OSError as e:
+            failed.append((manifest, str(e)))
+    if not dry and not failed:
+        try:
+            os.remove(idx)
+        except OSError:
+            pass
+    return n, failed
+
+
+def _merge_dep(root_spec, member_spec, root_dir, member_dir):
+    base = {"version": root_spec} if isinstance(root_spec, str) else dict(root_spec)
+    if "path" in base:
+        base["path"] = os.path.relpath(os.path.join(root_dir, base["path"]), member_dir)
+    if isinstance(member_spec, dict):
+        if member_spec.get("features"):
+            base["features"] = sorted(set(base.get("features", [])) | set(member_spec["features"]))
+        for k in ("optional", "default-features", "public"):
+            if k in member_spec:
+                base[k] = member_spec[k]
+    base.pop("workspace", None)
+    return base
+
+
+def _section_header(line):
+    m = re.match(r"\s*\[\s*([^\]]+?)\s*\]\s*(?:#.*)?$", line)
+    if not m:
+        return None
+    parts, buf, quote = [], "", None
+    for ch in m.group(1):
+        if quote:
+            buf += ch
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "\"'":
+            quote = ch
+            buf += ch
+            continue
+        if ch == ".":
+            parts.append(buf.strip())
+            buf = ""
+            continue
+        buf += ch
+    parts.append(buf.strip())
+    return [p.strip("\"'") for p in parts]
+
+
+DEP_SECTIONS = ("dependencies", "dev-dependencies", "build-dependencies")
+
+
+def materialize_manifest(manifest, root_manifest):
+    """Replace this manifest's `workspace = true` with its OWN root's literal values.
+
+    Section-aware on purpose: the same crate name can appear in [dependencies] and
+    [dev-dependencies] with different extras, and a whole-file substitution copies
+    one section's `optional = true` into the other — which cargo rejects outright.
+    Returns (n_changes, new_text, warnings). The result is valid under BOTH the repo
+    root and a parent root, so a half-finished toggle never breaks a repo.
+    """
+    warns = []
+    rt = _toml_load(root_manifest)
+    ws = rt.get("workspace") or {}
+    wpkg, wdep, wlint = ws.get("package") or {}, ws.get("dependencies") or {}, ws.get("lints") or {}
+    mt = _toml_load(manifest)
+    root_dir = os.path.dirname(os.path.abspath(root_manifest))
+    member_dir = os.path.dirname(os.path.abspath(manifest))
+    with open(manifest) as f:
+        text = f.read()
+    lines = text.split("\n")
+    out, header, n, i = [], [], 0, 0
+    while i < len(lines):
+        line = lines[i]
+        head = _section_header(line)
+        if head is not None:
+            header = head
+            if len(header) >= 2 and header[-2] in DEP_SECTIONS and header[-1] not in DEP_SECTIONS:
+                name, body, j = header[-1], [], i + 1
+                while j < len(lines) and _section_header(lines[j]) is None:
+                    body.append(lines[j])
+                    j += 1
+                if any(re.match(r"\s*workspace\s*=\s*true", b) for b in body) and name in wdep:
+                    spec = mt
+                    for k in header[:-1]:
+                        spec = (spec or {}).get(k) or {}
+                    merged = _merge_dep(wdep[name], spec.get(name) or {}, root_dir, member_dir)
+                    out.append("[" + ".".join(
+                        ('"%s"' % p if ("." in p or "(" in p) else p) for p in header) + "]")
+                    for k, v in merged.items():
+                        out.append("%s = %s" % (k, _toml_val(v)))
+                    n += 1
+                    i = j
+                    continue
+            out.append(line)
+            i += 1
+            continue
+        sect = header[-1] if header else ""
+        # inline tables may span lines: `foo = { workspace = true, features = [\n … ] }`
+        joined, span = line, 1
+        if re.match(r"\s*[A-Za-z0-9_.\"'-]+\s*=\s*\{", line) and joined.count("{") > joined.count("}"):
+            k = i
+            while k + 1 < len(lines) and joined.count("{") > joined.count("}"):
+                k += 1
+                joined += " " + lines[k].strip()
+            span = k - i + 1
+            joined = re.sub(r"\s+", " ", joined).rstrip()
+        m = re.match(r"\s*([A-Za-z0-9_.\"'-]+?)\s*(?:\.workspace\s*=\s*true|"
+                     r"=\s*\{(?P<inline>.*)\})[ \t]*(?P<cmt>#.*)?$", joined)
+        if m and "workspace" in joined and "true" in joined:
+            key = m.group(1).strip("\"'")
+            inline = m.group("inline")
+            if inline is not None and not re.search(r"\bworkspace\s*=\s*true\b", inline):
+                out.append(line)
+                i += 1
+                continue
+            cmt = ("  " + m.group("cmt")) if m.group("cmt") else ""
+            if sect in DEP_SECTIONS:
+                if key in wdep:
+                    spec = mt
+                    for k in header:
+                        spec = (spec or {}).get(k) or {}
+                    merged = _merge_dep(wdep[key], spec.get(key) or {}, root_dir, member_dir)
+                    out.append("%s = %s%s" % (key, _toml_val(merged), cmt))
+                    n += 1
+                    i += span
+                    continue
+                warns.append("%s: [%s] inherits `%s`, root defines no workspace.dependencies.%s"
+                             % (manifest, sect, key, key))
+            elif sect == "package":
+                if key in wpkg:
+                    out.append("%s = %s%s" % (key, _toml_val(wpkg[key]), cmt))
+                    n += 1
+                    i += span
+                    continue
+                warns.append("%s: [package] inherits `%s`, root defines no workspace.package.%s"
+                             % (manifest, key, key))
+            elif sect == "lints" and key == "workspace":
+                if wlint:
+                    while out and out[-1].strip() == "[lints]":
+                        out.pop()
+                    for group, body in wlint.items():
+                        out.append("[lints.%s]" % group)
+                        for k, v in body.items():
+                            out.append("%s = %s" % (k, _toml_val(v)))
+                    n += 1
+                    i += 1
+                    continue
+                warns.append("%s: inherits lints, root defines no [workspace.lints]" % manifest)
+        out.append(line)
+        i += 1
+    return n, "\n".join(out), warns
+
+
+def alias_crossing_path_deps(root):
+    """Path deps whose textual target differs from its realpath — a lockfile collision."""
+    hits = []
+    scans = _scan_dirs(root)
+    for scan in scans:
+        for name in sorted(os.listdir(scan)):
+            d = os.path.join(scan, name)
+            if not os.path.isdir(d) or os.path.islink(d) or name.startswith(".") or d in scans:
+                continue
+            for man in _walk_manifests(d):
+                try:
+                    with open(man) as f:
+                        text = f.read()
+                except OSError:
+                    continue
+                for rel in re.findall(r'path\s*=\s*"([^"]+)"', text):
+                    raw = os.path.normpath(os.path.join(os.path.dirname(man), rel))
+                    real = os.path.realpath(raw)
+                    if raw != real and real.startswith(root + os.sep):
+                        hits.append((os.path.relpath(man, root), rel,
+                                     os.path.relpath(real, root)))
+    return hits
+
+
+def normalize_alias_paths(root, dry=False):
+    """Rewrite alias-crossing path deps to the real directory, reversibly.
+
+    Under per-repo workspaces the two spellings never meet, so this is invisible; under
+    one lock it is a hard `package collision in the lockfile`. The rewrite is a no-op
+    for the repo's own build (same directory, different spelling), so it is safe to
+    leave in place and safe to undo.
+    """
+    n = 0
+    for man, rel, real in {(a, b, c) for a, b, c in alias_crossing_path_deps(root)}:
+        full = os.path.join(root, man)
+        try:
+            with open(full) as f:
+                text = f.read()
+        except OSError:
+            continue
+        orig = text
+        newrel = os.path.relpath(os.path.join(root, real), os.path.dirname(full))
+        text = text.replace('path = "%s"' % rel, 'path = "%s"' % newrel)
+        if text == orig:
+            continue
+        n += 1
+        if dry:
+            continue
+        _save_backup(root, full, orig)
+        with open(full, "w") as f:
+            f.write(text)
+    return n
+
+
+def unify_state(root):
+    return {
+        "config": os.path.join(root, ".cargo", "config.toml"),
+        "manifest": os.path.join(root, "Cargo.toml"),
+        "lock": os.path.join(root, "Cargo.lock"),
+        "backups": _backup_dir(root),
+        "index": os.path.join(_backup_dir(root), "index.tsv"),
+    }
+
+
+def _generated(path):
+    try:
+        with open(path) as f:
+            return "GENERATED by `zen unify`" in f.read(400)
+    except OSError:
+        return False
+
+
+def cmd_unify(argv):
+    opts, rest = parse_flags(
+        argv, {"--root": 1},
+        {"--patch", "--workspace", "--materialize", "-n", "--dry-run", "--force",
+         "-h", "--help"})
+    if "-h" in opts or "--help" in opts or not rest:
+        print(UNIFY_HELP)
+        return 0 if ("-h" in opts or "--help" in opts) else 2
+    sub = rest[0]
+    root = unify_root(opts)
+    dry = "-n" in opts or "--dry-run" in opts
+    st = unify_state(root)
+    if not os.path.isdir(root):
+        die("no such directory: %s" % root)
+
+    if sub == "status":
+        on_patch = os.path.exists(st["config"]) and _generated(st["config"])
+        on_ws = os.path.exists(st["manifest"]) and _generated(st["manifest"])
+        rewritten = 0
+        if os.path.exists(st["index"]):
+            with open(st["index"]) as f:
+                rewritten = sum(1 for ln in f if "\t" in ln)
+        print("root      %s" % root)
+        print("patch     %s  %s" % (green("ON ") if on_patch else dim("off"), st["config"]))
+        print("workspace %s  %s" % (green("ON ") if on_ws else dim("off"), st["manifest"]))
+        print("rewritten %s manifest(s)%s"
+              % (red(str(rewritten)) if rewritten else dim("0"),
+                 dim("   (zen unify off restores them)") if rewritten else ""))
+        if os.path.exists(st["manifest"]) and not on_ws:
+            print(red("WARNING: %s exists but was not generated by zen unify — left alone"
+                      % st["manifest"]))
+        if rewritten:
+            print(yellow("  do NOT commit while manifests are rewritten — `zen unify off` first"))
+        return 0
+
+    repos = classify_repos(root)
+
+    if sub == "plan":
+        claimable = [r for r in repos if not r["blockers"] and r["members"] and not r["alias"]]
+        blocked = [r for r in repos if r["blockers"]]
+        print("%d repo dirs under %s" % (len(repos), root))
+        for r in repos:
+            if r["alias"]:
+                tag = dim("alias")
+            elif r["blockers"]:
+                tag = yellow("block")
+            elif r["members"]:
+                tag = green("claim")
+            else:
+                tag = dim("  -  ")
+            print("%s %-26s %-14s crates=%-3d subws=%-2d %s"
+                  % (tag, r["rel"], r["kind"], len(r["members"]), len(r["subws"]),
+                     short("; ".join(r["blockers"] + r["notes"]), 74)))
+        print()
+        print("claimable now: %s repos / %s crates"
+              % (bold(str(len(claimable))), bold(str(sum(len(r["members"]) for r in claimable)))))
+        print("blocked on inheritance: %s repos / %s crates  (--materialize clears these)"
+              % (bold(str(len(blocked))), bold(str(sum(len(r["members"]) for r in blocked)))))
+        return 0
+
+    if sub == "doctor":
+        rc = 0
+        alias = alias_crossing_path_deps(root)
+        print(bold("path deps that cross a symlinked repo alias") +
+              dim("  — one lock cannot hold both spellings"))
+        for man, rel, real in alias:
+            print("  %-58s %s  ->  %s" % (short(man, 58), rel, real))
+            rc = 1
+        if not alias:
+            print(dim("  none"))
+        found, dupes = local_crates(root)
+        print()
+        print(bold("crate names that exist at two paths on disk"))
+        for nm, ds in sorted(dupes.items()):
+            print("  %-28s %s" % (nm, ", ".join(os.path.relpath(x, root) for x in ds)))
+            rc = 1
+        if not dupes:
+            print(dim("  none"))
+        print()
+        print(bold("[profile.*] declared at repo roots") +
+              dim("  — under one root, exactly one body applies"))
+        bodies = {}
+        for r in repos:
+            for name, body in ((r.get("root_table") or {}).get("profile") or {}).items():
+                bodies.setdefault(name, {})[r["rel"]] = json.dumps(body, sort_keys=True)
+        for name, per in sorted(bodies.items()):
+            distinct = len(set(per.values()))
+            line = "  %-28s %2d repos, %d distinct body(s)" % ("[profile.%s]" % name, len(per), distinct)
+            print(red(line) if distinct > 1 else dim(line))
+            if distinct > 1:
+                rc = 1
+        print()
+        print(bold("repo roots whose members inherit from them") +
+              dim("  — blocks claiming without --materialize"))
+        for r in repos:
+            if r.get("hard_inherit"):
+                print("  %-26s %d member(s): %s"
+                      % (r["rel"], len(r["hard_inherit"]),
+                         short(", ".join(sorted(r["hard_inherit"])), 60)))
+        return rc
+
+    if sub == "off":
+        n, failed = restore_backups(root, dry=dry)
+        if os.path.exists(st["lock"]) and not os.path.exists(st["manifest"]):
+            pass  # a lock with no manifest above it is inert; leave a stranger's file alone
+        elif os.path.exists(st["lock"]) and _generated(st["manifest"]):
+            print("%s %s" % (dim("rm") if not dry else dim("would rm"), st["lock"]))
+            if not dry:
+                os.remove(st["lock"])
+        for path in (st["manifest"], st["config"]):
+            if os.path.exists(path) and _generated(path):
+                print("%s %s" % (dim("rm") if not dry else dim("would rm"), path))
+                if not dry:
+                    os.remove(path)
+            elif os.path.exists(path):
+                warn("%s was not generated by zen unify — leaving it alone" % path)
+        print("%s %d manifest(s)" % ("would restore" if dry else green("restored"), n))
+        for man, err in failed:
+            print(red("  FAILED %s: %s" % (man, err)))
+        cargodir = os.path.dirname(st["config"])
+        if not dry and os.path.isdir(cargodir) and not os.listdir(cargodir):
+            os.rmdir(cargodir)
+        if not dry and not failed:
+            bd = _backup_dir(root)
+            if os.path.isdir(bd) and not os.listdir(bd):
+                os.rmdir(bd)
+                parent = os.path.dirname(bd)
+                if os.path.isdir(parent) and not os.listdir(parent):
+                    os.rmdir(parent)
+        return 1 if failed else 0
+
+    if sub != "on":
+        die("unknown subcommand %r (plan | doctor | on | off | status)" % sub)
+
+    want_ws = "--workspace" in opts or "--materialize" in opts
+    want_mat = "--materialize" in opts
+
+    if want_mat:
+        done, warns = 0, []
+        for r in repos:
+            if r["alias"] or not r.get("root_table"):
+                continue
+            rootman = os.path.join(r["dir"], "Cargo.toml")
+            for m in r["members"]:
+                man = os.path.join(m, "Cargo.toml")
+                try:
+                    n, new, w = materialize_manifest(man, rootman)
+                except Exception as e:
+                    warns.append("%s: %s" % (man, e))
+                    continue
+                warns.extend(w)
+                if not n:
+                    continue
+                done += 1
+                if dry:
+                    continue
+                with open(man) as f:
+                    _save_backup(root, man, f.read())
+                with open(man, "w") as f:
+                    f.write(new)
+        print("%s %d manifest(s) de-inherited" % ("would rewrite" if dry else green("rewrote"), done))
+        for w in warns[:20]:
+            warn(w)
+        if not dry:
+            repos = classify_repos(root)
+
+    if want_ws:
+        fixed = normalize_alias_paths(root, dry=dry)
+        if fixed:
+            print("%s %d alias-crossing path dep(s) to their real directory"
+                  % ("would rewrite" if dry else green("rewrote"), fixed))
+        text, claimed, notes = gen_workspace_manifest(root, repos)
+        if os.path.exists(st["manifest"]) and not _generated(st["manifest"]) and "--force" not in opts:
+            die("%s exists and was not generated by zen unify; --force to overwrite"
+                % st["manifest"])
+        print("%s %s  (%d crates claimed)"
+              % ("would write" if dry else green("wrote"), st["manifest"], len(claimed)))
+        for n in notes:
+            if "CONFLICT" in n or "SKIP" in n:
+                print(dim("  " + n))
+        if not dry:
+            with open(st["manifest"], "w") as f:
+                f.write(text)
+
+    text, found, dupes = gen_patch_config(root)
+    if os.path.exists(st["config"]) and not _generated(st["config"]) and "--force" not in opts:
+        die("%s exists and was not generated by zen unify; --force to overwrite" % st["config"])
+    print("%s %s  (%d crates patched to local paths)"
+          % ("would write" if dry else green("wrote"), st["config"], len(found)))
+    for nm, ds in sorted(dupes.items()):
+        warn("ambiguous crate %s at %s" % (nm, ", ".join(os.path.relpath(x, root) for x in ds)))
+    if not dry:
+        os.makedirs(os.path.dirname(st["config"]), exist_ok=True)
+        with open(st["config"], "w") as f:
+            f.write(text)
+    print()
+    print(dim("verify:  cd %s && cargo metadata --format-version 1 >/dev/null" % root))
+    print(dim("undo:    zen unify off --root %s" % root))
+    return 0
+
+
 def parse_flags(argv, valued, flags):
     """Tiny parser. `valued` maps flag -> 1 (single) or "many" (repeatable)."""
     opts, positional = {}, []
@@ -1836,6 +2605,7 @@ COMMANDS = {
     "markers": (cmd_markers, "audit .workongoing across the tree; find leaks"),
     "fmt": (cmd_fmt, "package-scoped cargo fmt + reflow-vs-logic diff classifier"),
     "space": (cmd_space, "largest unclaimed cargo target dirs; --reclaim to act"),
+    "unify": (cmd_unify, "one reversible Cargo view over the whole tree; plan/doctor/on/off"),
 }
 
 TOP_HELP = """\

@@ -202,6 +202,48 @@ Two guards: a repo with a live `.workongoing` is never selected, and a target
 touched within `--hot` minutes (default 20) is treated as an in-flight build.
 Prints commands; only `--yes` deletes. Full scan: ~3.7 s.
 
+### `zenunify` — one Cargo view over the whole tree, reversibly
+
+```
+$ zenunify plan
+claim zen/zenwebp             plain-package  crates=1  subws=3
+block zen/zenjpeg             virtual        crates=6  subws=2  5 member(s) inherit …
+…
+claimable now: 17 repos / 30 crates
+blocked on inheritance: 11 repos / 79 crates  (--materialize clears these)
+
+$ zenunify on --materialize
+rewrote 70 manifest(s) de-inherited
+rewrote 5 alias-crossing path dep(s) to their real directory
+wrote  ~/work/Cargo.toml            (109 crates claimed)
+wrote  ~/work/.cargo/config.toml    (148 crates patched to local paths)
+
+$ zenunify off
+restored 74 manifest(s)
+```
+
+Three independent layers, cheapest first. `--patch` writes one
+`.cargo/config.toml` above the repos and touches no manifest — it is the only
+layer that reaches nested standalone sub-workspaces (`fuzz/`, `apidoc/`),
+because cargo discovers config by walking up but never treats those
+directories as members. `--workspace` adds the parent `Cargo.toml`, claiming
+every crate it can and excluding every repo directory (an explicit `members`
+entry wins over `exclude`, which is what lets a hybrid repo's leaves join while
+its root package stays out). `--materialize` rewrites `foo.workspace = true` to
+the literal value from that crate's **own** repo root, which is what unblocks
+the 11 repos whose members inherit.
+
+`off` restores every rewritten manifest byte-for-byte from
+`<root>/.zenunify/backups/` — verified over a 30-repo mirror: 211 manifests,
+0 mismatches after an on → build → off cycle. Backups live outside the repos on
+purpose: a `Cargo.toml.bak` beside a `Cargo.toml` **is packaged into the
+`.crate`**, which happened in testing.
+
+`doctor` reports what a unified view would expose without turning anything on:
+path deps that cross a symlinked repo alias, crate names present at two paths,
+`[profile.*]` bodies that disagree across repo roots, and the repos whose
+members inherit from them.
+
 ---
 
 ## The traps these encode

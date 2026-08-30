@@ -1878,6 +1878,22 @@ def _scan_dirs(root):
     return dirs
 
 
+def _is_secondary_checkout(d):
+    """A git worktree or a jj workspace of some other repo.
+
+    TRAP: these hold a full copy of every crate under the SAME package names. In a
+    unified view that is `two packages named X in this workspace`, and in a shared
+    patch table it is a silent coin-flip over which copy wins. bin/README documents
+    the `--`-suffix convention; this checks the filesystem instead of the name.
+    """
+    dotgit = os.path.join(d, ".git")
+    if os.path.isfile(dotgit):          # git worktree: .git is a file, not a dir
+        return True
+    if os.path.isdir(os.path.join(d, ".jj")) and not os.path.exists(dotgit):
+        return True                     # jj workspace with no colocated git dir
+    return False
+
+
 def _walk_manifests(top):
     for dirpath, dirnames, filenames in os.walk(top):
         dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
@@ -1925,6 +1941,11 @@ def classify_repos(root):
                 # written through the alias resolves to a *different* manifest path for the
                 # same package name, and one lock cannot hold both.
                 info["notes"].append("symlink -> %s" % os.path.relpath(os.path.realpath(d), root))
+                out.append(info)
+                continue
+            if _is_secondary_checkout(d):
+                info["kind"] = "worktree"
+                info["notes"].append("git worktree / jj workspace — excluded, never claimed")
                 out.append(info)
                 continue
             real = os.path.realpath(d)
@@ -2002,6 +2023,8 @@ def local_crates(root):
             d = os.path.join(scan, name)
             if not os.path.isdir(d) or os.path.islink(d) or name.startswith(".") or d in scans:
                 continue
+            if _is_secondary_checkout(d):
+                continue
             for man in _walk_manifests(d):
                 parts = os.path.relpath(man, d).split(os.sep)
                 if "apidoc" in parts or "fuzz" in parts:
@@ -2037,10 +2060,16 @@ def gen_patch_config(root, wanted=None):
     for nm, (d, ver) in sorted(found.items()):
         if wanted is not None and nm not in wanted:
             continue
+        if nm in dupes:
+            continue        # never guess which copy wins — see the comments below
         lines.append('%s = { path = "%s" }%s'
                      % (nm, os.path.relpath(d, root), ("  # %s" % ver) if ver else ""))
-    for nm, ds in sorted(dupes.items()):
-        lines.append("# AMBIGUOUS %s: %s" % (nm, ", ".join(os.path.relpath(x, root) for x in ds)))
+    if dupes:
+        lines.append("")
+        lines.append("# OMITTED — the same crate name exists at more than one path, so there")
+        lines.append("# is no single right answer. Fix the duplication or patch it by hand.")
+        for nm, ds in sorted(dupes.items()):
+            lines.append("#   %s: %s" % (nm, ", ".join(os.path.relpath(x, root) for x in ds)))
     return "\n".join(lines) + "\n", found, dupes
 
 
@@ -2237,6 +2266,20 @@ def materialize_manifest(manifest, root_manifest):
             i += 1
             continue
         sect = header[-1] if header else ""
+        # `[lints]` + a bare `workspace = true` is its own shape — no key prefix, no inline
+        # table — so the general pattern below cannot see it.
+        if sect == "lints" and re.match(r"\s*workspace\s*=\s*true[ \t]*(#.*)?$", line):
+            if wlint:
+                while out and out[-1].strip() == "[lints]":
+                    out.pop()
+                for group, body in wlint.items():
+                    out.append("[lints.%s]" % group)
+                    for k, v in body.items():
+                        out.append("%s = %s" % (k, _toml_val(v)))
+                n += 1
+                i += 1
+                continue
+            warns.append("%s: inherits lints, root defines no [workspace.lints]" % manifest)
         # inline tables may span lines: `foo = { workspace = true, features = [\n … ] }`
         joined, span = line, 1
         if re.match(r"\s*[A-Za-z0-9_.\"'-]+\s*=\s*\{", line) and joined.count("{") > joined.count("}"):

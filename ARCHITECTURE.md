@@ -30,6 +30,7 @@ those are the most useful entries to keep current.
 | **ML forensic inventory** | 7-part 2026-05-20 audit of repos + parquets + datasets | `~/work/zen/_ml-inventory-2026-05-20/00-MASTER-SYNTHESIS.md` |
 | **R2 credentials / fleet** | scoped-cred minting, session-token gotcha, launcher-mints-per-sweep | `~/work/claudehints/topics/r2-credentials.md` |
 | **Crate index** | full crate list + one-line descriptions | `~/.claude/CLAUDE.md` ("Imazen Crate Index") |
+| **Workspace structure** | monorepo-vs-targeted-fixes decision; cargo workspace/patch semantics (T1–T11); shared `.cargo/config.toml` dev patch table; cross-machine cost | `zen-workspace/WORKSPACE_STRUCTURE_2026-08-30.md` |
 | **Per-repo agent context** | methodology, gotchas, known bugs per repo | each repo's `CLAUDE.md` |
 
 ---

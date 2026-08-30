@@ -11,6 +11,52 @@ a Rust binary would need compiling on each one, and macOS still ships bash 3.2,
 which rules out portable shell with associative arrays, `mapfile`, or a single
 `stat` invocation that works on both platforms.
 
+## Standing rule: **never wait on CI**
+
+Owner directive, 2026-08-30: *"ban waiting on CI, ever."* No agent, no session,
+no script blocks on a CI run reaching a terminal state. Push, confirm the commit
+actually landed, and move on.
+
+**Why, measured rather than asserted.** Share of the last 25 CI runs on the
+default branch that ended `cancelled`, sampled 2026-08-30:
+
+| repo | cancel rate |
+|---|--:|
+| zenpipe | 80 % |
+| zenmetrics / zensim / zenanalyze | 72 % |
+| zenavif | 52 % |
+| zenjpeg | 44 % |
+| zenwebp | 20 % |
+
+Waiting is therefore unbounded *and* frequently yields nothing. On the evening
+this rule was written, **zenanalyze took eight consecutive cancelled runs and
+produced zero verdicts** while two agents sat watching — each push from one
+cancelled the other's run through `cancel-in-progress: true`. Observed run
+durations that night reached 2 h 16 m. An agent that blocks on that is spending
+its budget on a coin flip.
+
+**The rule is not "ignore CI" — it is "check it asynchronously."** The
+replacement is mechanical:
+
+1. Push.
+2. `zenverify <sha>` — on the trunk, non-empty, contains the paths you expected.
+   That is the check that actually protects you, and it is instant.
+3. **Move on to the next piece of work.**
+4. Later — next session, next sweep, whenever — `zenred` says what is red across
+   the whole tree with blame attached, and `zenci --since <sha>` answers "did my
+   commit ever get a verdict, or was it superseded?"
+
+**What carries the confidence in the meantime: local gates.** Tests, clippy
+`-D warnings`, fmt, byte-identity locks, mutation-verification, compiling the
+real consumers. Those are the substantive evidence and they run in seconds to
+minutes under your control. CI is a backstop that gets *swept*, not a gate you
+block on — and a `cancelled` run was never evidence of anything anyway.
+
+Two corollaries worth stating, because both were violated the day this was
+written: never report "CI is green" when the run was cancelled or still queued —
+say which — and never let a watcher refresh a `.workongoing` marker, because a
+repo held by a waiter is a repo nobody else can claim.
+
 ## Install
 
 ```sh

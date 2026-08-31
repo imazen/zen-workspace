@@ -31,6 +31,8 @@ those are the most useful entries to keep current.
 | **R2 credentials / fleet** | scoped-cred minting, session-token gotcha, launcher-mints-per-sweep | `~/work/claudehints/topics/r2-credentials.md` |
 | **Crate index** | full crate list + one-line descriptions | `~/.claude/CLAUDE.md` ("Imazen Crate Index") |
 | **Workspace structure** | monorepo-vs-targeted-fixes decision; cargo workspace/patch semantics (T1–T11); shared `.cargo/config.toml` dev patch table; cross-machine cost | `zen-workspace/WORKSPACE_STRUCTURE_2026-08-30.md` |
+
+- [`CONFIG_OVER_FLAGS_2026-08-31.md`](CONFIG_OVER_FLAGS_2026-08-31.md) — why exploration variants are runtime *values*, not cargo features or env vars; the 37-feature / 205-env-call measurement, the four mechanisms, and the three-phase migration.
 | **Per-repo agent context** | methodology, gotchas, known bugs per repo | each repo's `CLAUDE.md` |
 
 ---

@@ -1283,6 +1283,17 @@ def dirty_state(repo):
 
     The dangerous case is not 'a marker exists' — it is 'the working copy
     holds somebody else's uncommitted edits'. That is what must block.
+
+    In jj, "@ has file changes" is NOT that condition: @ is a real commit, so it
+    always shows content relative to its parent, and a described change is
+    authored, attributable, recoverable work. Treating that as foreign made this
+    warn on every ordinary claim — and a warning that always fires is a warning
+    nobody reads, which is precisely how the T3→T4 jxl-encoder handoff on
+    2026-08-31 passed a dirty tree across agents unnoticed.
+
+    The predicate that actually separates the cases is **non-empty AND
+    undescribed**: nobody has put their name to those edits, so nobody owns them.
+    That is the state worth blocking on, and it is what T3 left behind.
     """
     if os.path.exists(os.path.join(repo.path, ".jj")):
         rc, so, se = run(["jj", "status", "--no-pager"], cwd=repo.path, timeout=60)
@@ -1296,8 +1307,16 @@ def dirty_state(repo):
                 lines.append(line.strip())
             if line.startswith(("Working copy ", "Parent commit")):
                 break
-        return bool(lines), ("%d file(s) modified in @: %s" % (len(lines), "; ".join(lines[:3])) if lines
-                             else "@ is clean")
+        if not lines:
+            return False, "@ is clean"
+        rc2, desc, _ = run(["jj", "log", "--no-pager", "-r", "@", "--no-graph",
+                            "-T", "description"], cwd=repo.path, timeout=60)
+        described = rc2 == 0 and desc.strip() != ""
+        summary = "%d file(s) in @: %s" % (len(lines), "; ".join(lines[:3]))
+        if described:
+            # Authored work — attributable and recoverable. Report it, don't block.
+            return False, "%s (described: %s)" % (summary, desc.strip().splitlines()[0][:50])
+        return True, "%s — UNDESCRIBED, nobody owns it" % summary
     rc, so, _ = run(["git", "status", "--porcelain"], cwd=repo.path, timeout=60)
     tracked = [ln for ln in so.splitlines() if not ln.startswith("??")]
     untracked = [ln for ln in so.splitlines() if ln.startswith("??")]
@@ -1381,7 +1400,10 @@ RELEASE_HELP = """\
 zenrelease [repo] [options]     drop the marker when you are done
 
   --pause "<reason>"   keep the marker but rewrite it as paused, for the next agent
-  --force              release a marker owned by another agent
+  --force              release a marker owned by another agent, or over loose work
+
+Refuses to release while @ holds UNDESCRIBED changes: dropping the marker would
+make them ownerless for whoever claims next. Name them (jj describe) or --pause.
 """
 
 
@@ -1405,6 +1427,19 @@ def cmd_release(argv):
             f.write("%s %s paused-%s\n" % (iso_now(), agent_id(), opts["--pause"].replace(" ", "-")))
         print(yellow("PAUSED") + " %s — marker left in place for the next agent" % repo.name)
         return 0
+    # Releasing is the moment the ONLY agent who knows whose those edits are is
+    # still holding the repo. Once the marker is gone, undescribed work in @ is
+    # ownerless, and the next agent inherits it with no way to tell it apart from
+    # its own. Refuse here rather than warn there.
+    foreign, desc = dirty_state(repo)
+    if foreign and "--force" not in opts:
+        print(red("REFUSED") + " — %s: %s" % (repo.name, desc))
+        print("  " + dim("releasing now makes that work ownerless for the next agent."))
+        print("  " + dim("give it a name:  jj describe -m '<what it is>'    (then release)"))
+        print("  " + dim("or keep the repo: zenrelease --pause '<reason>'"))
+        print("  " + dim("--force only if you are certain it is disposable — never discard it"))
+        return 1
+
     os.remove(mp)
     print(green("RELEASED") + " %s" % repo.name)
     return 0

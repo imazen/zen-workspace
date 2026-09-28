@@ -32,6 +32,10 @@ on:
         description: 'Skip MSRV check'
         type: boolean
         default: false
+      sibling_overrides:
+        description: 'Override declared dependency pins with sibling checkouts'
+        type: boolean
+        default: true
       workspace_ref:
         description: 'zen-workspace ref to use'
         type: string
@@ -46,14 +50,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: imazen/zen-workspace/.github/actions/setup@main
+      - uses: imazen/zen-workspace/.github/actions/setup@682b725a555350afefab5e0f936fbb7955d95a64
         with:
           components: rustfmt
           workspace-ref: ${{ inputs.workspace_ref }}
+          sibling-overrides: ${{ inputs.sibling_overrides }}
       # Scope to in-repo workspace members: `cargo fmt --all` also reaches
       # into path-dependency crates, and after ci-clone those are sibling
       # clones of OTHER repos (their formatting is not this repo's gate).
-      - run: cargo fmt $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name' | sed 's/^/-p /') -- --check
+      - name: Check workspace formatting
+        shell: bash
+        run: |
+          metadata=$(cargo metadata --no-deps --format-version 1)
+          mapfile -t package_args < <(jq -r '.packages[] | "-p", .name' <<< "$metadata")
+          cargo fmt "${package_args[@]}" -- --check
 
   clippy:
     name: Clippy (${{ matrix.os }})
@@ -64,10 +74,11 @@ jobs:
         os: ${{ fromJSON(inputs.platforms) }}
     steps:
       - uses: actions/checkout@v6
-      - uses: imazen/zen-workspace/.github/actions/setup@main
+      - uses: imazen/zen-workspace/.github/actions/setup@682b725a555350afefab5e0f936fbb7955d95a64
         with:
           components: clippy
           workspace-ref: ${{ inputs.workspace_ref }}
+          sibling-overrides: ${{ inputs.sibling_overrides }}
       - run: cargo clippy ${{ inputs.clippy_args }}
       - name: Extra clippy runs
         if: inputs.clippy_extra_runs != ''
@@ -89,9 +100,10 @@ jobs:
         os: ${{ fromJSON(inputs.platforms) }}
     steps:
       - uses: actions/checkout@v6
-      - uses: imazen/zen-workspace/.github/actions/setup@main
+      - uses: imazen/zen-workspace/.github/actions/setup@682b725a555350afefab5e0f936fbb7955d95a64
         with:
           workspace-ref: ${{ inputs.workspace_ref }}
+          sibling-overrides: ${{ inputs.sibling_overrides }}
       - run: cargo test ${{ inputs.test_args }}
       - name: Extra test runs
         if: inputs.test_extra_runs != ''
@@ -110,8 +122,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: imazen/zen-workspace/.github/actions/setup@main
+      - uses: imazen/zen-workspace/.github/actions/setup@682b725a555350afefab5e0f936fbb7955d95a64
         with:
           workspace-ref: ${{ inputs.workspace_ref }}
+          sibling-overrides: ${{ inputs.sibling_overrides }}
       - uses: taiki-e/install-action@cargo-hack
       - run: cargo hack check --rust-version

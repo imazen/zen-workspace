@@ -13,3 +13,7 @@ when the command should also reject lockfile updates.
 This matters for coordinated codec PRs: replacing a pinned AVIF adapter with
 one sibling checkout while replacing its pinned native encoder with a different
 revision can remove the very API that the adapter was written against.
+
+The reusable `rust-ci.yml` exposes the same switch as the boolean input
+`sibling_overrides`. Its setup action is pinned to the revision that defines
+this input, so a reusable-workflow PR does not depend on an unmerged `main` API.

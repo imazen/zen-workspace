@@ -1,7 +1,11 @@
 name: 'Superwork CI Setup'
-description: 'Checkout zen-workspace, install cargo-superwork, clone dep repos with path overrides'
+description: 'Install Rust tooling with optional sibling dependency overrides'
 
 inputs:
+  sibling-overrides:
+    description: 'Clone current sibling sources and override dependency pins (false keeps manifests and lockfiles authoritative)'
+    required: false
+    default: 'true'
   components:
     description: 'Rust toolchain components (comma-separated, e.g., "clippy,rustfmt")'
     required: false
@@ -27,6 +31,7 @@ runs:
   using: composite
   steps:
     - name: Checkout zen-workspace
+      if: inputs.sibling-overrides == 'true'
       uses: actions/checkout@v6
       with:
         repository: imazen/zen-workspace
@@ -50,6 +55,7 @@ runs:
         fi
 
     - name: Install cargo-superwork
+      if: inputs.sibling-overrides == 'true'
       shell: bash
       run: |
         if ! command -v cargo-superwork >/dev/null 2>&1; then
@@ -57,6 +63,7 @@ runs:
         fi
 
     - name: Clone dependency repos
+      if: inputs.sibling-overrides == 'true'
       shell: bash
       run: cargo superwork ci-clone --add-paths --recursive --config zen-workspace/Superwork.toml
 

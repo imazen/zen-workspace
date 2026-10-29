@@ -3,6 +3,10 @@ name: Rust CI (reusable)
 on:
   workflow_call:
     inputs:
+      sibling_overrides:
+        description: 'Clone sibling sources and install path overrides'
+        type: boolean
+        default: true
       test_args:
         description: 'cargo test arguments (e.g., "--all-targets --features foo")'
         type: string
@@ -50,6 +54,7 @@ jobs:
         with:
           components: rustfmt
           workspace-ref: ${{ inputs.workspace_ref }}
+          sibling-overrides: ${{ inputs.sibling_overrides }}
       # Scope to in-repo workspace members: `cargo fmt --all` also reaches
       # into path-dependency crates, and after ci-clone those are sibling
       # clones of OTHER repos (their formatting is not this repo's gate).
@@ -68,6 +73,7 @@ jobs:
         with:
           components: clippy
           workspace-ref: ${{ inputs.workspace_ref }}
+          sibling-overrides: ${{ inputs.sibling_overrides }}
       - run: cargo clippy ${{ inputs.clippy_args }}
       - name: Extra clippy runs
         if: inputs.clippy_extra_runs != ''
@@ -92,6 +98,7 @@ jobs:
       - uses: imazen/zen-workspace/.github/actions/setup@main
         with:
           workspace-ref: ${{ inputs.workspace_ref }}
+          sibling-overrides: ${{ inputs.sibling_overrides }}
       - run: cargo test ${{ inputs.test_args }}
       - name: Extra test runs
         if: inputs.test_extra_runs != ''
@@ -113,5 +120,6 @@ jobs:
       - uses: imazen/zen-workspace/.github/actions/setup@main
         with:
           workspace-ref: ${{ inputs.workspace_ref }}
+          sibling-overrides: ${{ inputs.sibling_overrides }}
       - uses: taiki-e/install-action@cargo-hack
       - run: cargo hack check --rust-version
